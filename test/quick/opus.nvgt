@@ -1,0 +1,281 @@
+// Comprehensive test for the opus codec plugin.
+// Covers: opus_encoder, opus_decoder, opus_file_writer, opus_file_reader,
+//         packet utility functions, all CTLs, and error handling.
+
+#pragma plugin opus
+
+// ── PCM helpers ───────────────────────────────────────────────────────────────
+
+// 440 Hz sine wave as int16 LE PCM (2 bytes per sample).
+string make_tone(int num_samples, int freq = 440, int sample_rate = 48000) {
+	datastream ds;
+	for (int i = 0; i < num_samples; i++) {
+		float t = float(i) / float(sample_rate);
+		int16 s = int16(16000.0f * sin(6.283185307f * float(freq) * t));
+		ds << s;
+	}
+	return ds.str();
+}
+
+// 440 Hz sine wave as float32 LE PCM (4 bytes per sample, range [-0.5, 0.5]).
+// datastream defaults to binary mode so << writes raw IEEE 754 bytes.
+string make_tone_float(int num_samples, int freq = 440, int sample_rate = 48000) {
+	datastream ds;
+	for (int i = 0; i < num_samples; i++) {
+		float t = float(i) / float(sample_rate);
+		float s = 0.5f * sin(6.283185307f * float(freq) * t);
+		ds << s;
+	}
+	return ds.str();
+}
+
+// ── test sections ─────────────────────────────────────────────────────────────
+
+void test_encoder_basics() {
+	println("=== opus_encoder: basics ===");
+	opus_encoder@ enc = opus_encoder(48000, 1, OPUS_APPLICATION_VOIP);
+	assert(enc.valid);
+	assert(enc.sample_rate == 48000);
+	assert(enc.channels == 1);
+	println("valid=" + enc.valid + "  sample_rate=" + enc.sample_rate + "  channels=" + enc.channels);
+}
+
+void test_encoder_controls() {
+	println("\n=== opus_encoder: controls ===");
+	opus_encoder@ enc = opus_encoder(48000, 2, OPUS_APPLICATION_AUDIO);
+	assert(enc.valid);
+
+	assert(enc.set_bitrate(128000));      println("bitrate:          " + enc.bitrate);
+	assert(enc.set_complexity(8));        println("complexity:       " + enc.complexity);
+	assert(enc.set_vbr(true));            println("vbr:              " + enc.vbr);
+	assert(enc.set_vbr_constraint(true)); println("vbr_constraint:   " + enc.vbr_constraint);
+	assert(enc.set_dtx(true));            println("dtx:              " + enc.dtx);
+	assert(enc.set_inband_fec(true));     println("inband_fec:       " + enc.inband_fec);
+	assert(enc.set_expected_loss(10));    println("expected_loss:    " + enc.expected_loss);
+	assert(enc.set_signal(OPUS_SIGNAL_MUSIC)); println("signal:       " + enc.signal);
+	assert(enc.set_bandwidth(1105));      println("bandwidth:        " + enc.bandwidth + " (1105=fullband)");
+	assert(enc.reset_state());            println("reset_state:      OK");
+
+	// verify getters reflect setters
+	assert(enc.bitrate == 128000);
+	assert(enc.complexity == 8);
+	assert(enc.vbr == true);
+	assert(enc.inband_fec == true);
+	assert(enc.expected_loss == 10);
+}
+
+void test_encode_decode_roundtrip() {
+	println("\n=== encode/decode round trip ===");
+	opus_encoder@ enc = opus_encoder(48000, 1, OPUS_APPLICATION_VOIP);
+	opus_decoder@ dec = opus_decoder(48000, 1);
+	assert(enc.valid && dec.valid);
+
+	// int16 round trip
+	string pcm_in = make_tone(960);
+	assert(pcm_in.length() == 1920);
+
+	string packet = enc.encode(pcm_in);
+	assert(packet.length() > 0, "encode returned empty: " + enc.last_error);
+	println("int16:   " + pcm_in.length() + " bytes PCM  →  " + packet.length() + " bytes packet");
+
+	string pcm_out = dec.decode(packet);
+	assert(pcm_out.length() > 0, "decode returned empty: " + dec.last_error);
+	println("decoded: " + pcm_out.length() + " bytes  (" + pcm_out.length() / 2 + " samples)");
+
+	// float32 encode
+	string pcmf_in = make_tone_float(960);
+	assert(pcmf_in.length() == 3840); // 960 * 4
+	string packetf = enc.encode_float(pcmf_in);
+	assert(packetf.length() > 0, "encode_float returned empty: " + enc.last_error);
+	println("float32: " + pcmf_in.length() + " bytes PCM  →  " + packetf.length() + " bytes packet");
+
+	// float32 decode
+	string pcmf_out = dec.decode_float(packet);
+	assert(pcmf_out.length() > 0, "decode_float returned empty: " + dec.last_error);
+	println("decode_float: " + pcmf_out.length() + " bytes  (" + pcmf_out.length() / 4 + " samples)");
+}
+
+void test_decoder_controls() {
+	println("\n=== opus_decoder: controls ===");
+	opus_encoder@ enc = opus_encoder(48000, 1);
+	opus_decoder@ dec = opus_decoder(48000, 1);
+	assert(enc.valid && dec.valid);
+
+	string packet = enc.encode(make_tone(960));
+	assert(packet.length() > 0);
+	dec.decode(packet); // prime decoder state
+
+	println("last_packet_duration: " + dec.last_packet_duration + " samples");
+	println("bandwidth:            " + dec.bandwidth);
+
+	assert(dec.set_gain(256));
+	assert(dec.gain == 256);
+	println("gain set to 256 (+6 dB): " + dec.gain);
+
+	assert(dec.set_gain(0));
+	println("gain reset to 0:         " + dec.gain);
+
+	// packet loss concealment
+	string concealed = dec.conceal(960);
+	assert(concealed.length() > 0, "conceal returned empty: " + dec.last_error);
+	println("conceal 960 samples: " + concealed.length() + " bytes");
+
+	assert(dec.reset_state());
+	println("reset_state: OK");
+}
+
+void test_packet_utils() {
+	println("\n=== packet utilities ===");
+	opus_encoder@ enc = opus_encoder(48000, 1);
+	string packet = enc.encode(make_tone(960));
+	assert(packet.length() > 0);
+
+	int frames = opus_packet_frames(packet);
+	int samples = opus_packet_samples(packet, 48000);
+	int bw      = opus_packet_bandwidth(packet);
+	int ch      = opus_packet_channels(packet);
+
+	println("frames:    " + frames);
+	println("samples:   " + samples);
+	println("bandwidth: " + bw);
+	println("channels:  " + ch);
+
+	assert(frames >= 1);
+	assert(samples > 0);
+	assert(ch == 1);
+
+	// empty packet → OPUS_INVALID_PACKET (negative)
+	int bad = opus_packet_frames("");
+	println("frames from empty packet: " + bad + " (expected negative)");
+	assert(bad < 0);
+}
+
+void test_file_writer() {
+	println("\n=== opus_file_writer ===");
+	string path = "test_opus.opus";
+
+	opus_file_writer@ w = opus_file_writer(path, 48000, 1);
+	assert(w.valid, "writer not valid: " + w.last_error);
+	println("valid=" + w.valid + "  sample_rate=" + w.sample_rate + "  channels=" + w.channels);
+
+	// comments must come before first write
+	assert(w.add_comment("TITLE", "Opus Plugin Test"));
+	assert(w.add_comment("ARTIST", "NVGT"));
+
+	// all writer controls
+	assert(w.set_bitrate(96000));
+	assert(w.set_complexity(10));
+	assert(w.set_vbr(true));
+	assert(w.set_cvbr(false));
+	assert(w.set_dtx(false));
+	assert(w.set_application(OPUS_APPLICATION_AUDIO));
+	assert(w.set_signal(OPUS_SIGNAL_MUSIC));
+	println("controls set OK");
+
+	// write 48 × 960-sample frames = 1 second of audio
+	for (int i = 0; i < 48; i++) {
+		string frame = make_tone(960, 440);
+		assert(w.write(frame), "write frame " + i + ": " + w.last_error);
+	}
+	println("wrote 48 frames (1 second)");
+
+	// write_float path: write another half second
+	for (int i = 0; i < 24; i++) {
+		string frame = make_tone_float(960, 440);
+		assert(w.write_float(frame), "write_float frame " + i + ": " + w.last_error);
+	}
+	println("wrote 24 float frames (0.5 seconds)");
+
+	assert(w.close(), "close failed: " + w.last_error);
+	assert(!w.valid);
+	println("closed OK  |  file size: " + file_get_size(path) + " bytes");
+}
+
+void test_file_reader() {
+	println("\n=== opus_file_reader ===");
+	string path = "test_opus.opus";
+
+	opus_file_reader@ r = opus_file_reader(path);
+	assert(r.valid, "reader not valid: " + r.last_error);
+	println("valid=" + r.valid + "  channels=" + r.channels + "  sample_rate=" + r.sample_rate);
+	assert(r.channels == 1);
+	assert(r.sample_rate == 48000);
+	println("pcm_total: " + r.pcm_total + " samples");
+	assert(r.pcm_total > 0);
+
+	// read a chunk
+	string chunk = r.read(960);
+	assert(chunk.length() > 0, "read returned empty: " + r.last_error);
+	println("read(960):        got " + chunk.length() / 2 + " samples");
+
+	int64 pos = r.tell();
+	assert(pos > 0);
+	println("position:         " + pos);
+
+	// seek back and read float
+	assert(r.seek(0), "seek failed: " + r.last_error);
+	assert(r.tell() == 0);
+	println("seeked to 0");
+
+	string chunk_f = r.read_float(960);
+	assert(chunk_f.length() > 0, "read_float returned empty: " + r.last_error);
+	println("read_float(960):  got " + chunk_f.length() / 4 + " samples");
+
+	// read_all
+	r.seek(0);
+	string all = r.read_all();
+	assert(all.length() > 0);
+	println("read_all:         " + all.length() / 2 + " total samples");
+
+	r.seek(0);
+	string all_f = r.read_all_float();
+	assert(all_f.length() > 0);
+	println("read_all_float:   " + all_f.length() / 4 + " total samples");
+
+	// cleanup
+	file_delete(path);
+	println("cleaned up " + path);
+}
+
+void test_error_handling() {
+	println("\n=== error handling ===");
+
+	// bad sample rate
+	opus_encoder@ bad_enc = opus_encoder(1000, 1);
+	assert(!bad_enc.valid);
+	println("bad encoder  valid=" + bad_enc.valid + "  error=" + bad_enc.last_error);
+
+	// bad channel count
+	opus_decoder@ bad_dec = opus_decoder(48000, 0);
+	assert(!bad_dec.valid);
+	println("bad decoder  valid=" + bad_dec.valid + "  error=" + bad_dec.last_error);
+
+	// nonexistent file
+	opus_file_reader@ bad_r = opus_file_reader("does_not_exist.opus");
+	assert(!bad_r.valid);
+	println("bad reader   valid=" + bad_r.valid + "  error=" + bad_r.last_error);
+
+	// unwritable path
+	opus_file_writer@ bad_w = opus_file_writer("Z:/no/such/path/out.opus", 48000, 1);
+	assert(!bad_w.valid);
+	println("bad writer   valid=" + bad_w.valid + "  error=" + bad_w.last_error);
+
+	// operations on invalid objects return safe empty values
+	assert(bad_enc.encode(make_tone(960)) == "");
+	assert(bad_dec.decode("fake packet") == "");
+	println("ops on invalid objects return empty strings: OK");
+}
+
+// ── entry point ───────────────────────────────────────────────────────────────
+
+void main() {
+	test_encoder_basics();
+	test_encoder_controls();
+	test_encode_decode_roundtrip();
+	test_decoder_controls();
+	test_packet_utils();
+	test_file_writer();
+	test_file_reader();  // reads file created by test_file_writer, then deletes it
+	test_error_handling();
+	println("\n=== all opus tests complete ===");
+}

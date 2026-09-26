@@ -1,0 +1,8 @@
+Import("env")
+
+opus_libs = ["opusfile", "opusenc", "opus", "ogg"]
+if ARGUMENTS.get("no_shared_plugins", "0") == "0":
+	env.SharedLibrary("#release/lib/opus", ["opus.cpp"], LIBS = env["LIBS"] + opus_libs)
+static = env.Object("opus_static", "opus.cpp", CPPDEFINES = env["CPPDEFINES"] + [("NVGT_PLUGIN_STATIC", "opus")])
+static = env.StaticLibrary("#build/lib/opus_plugin", [static])
+Return("static")
