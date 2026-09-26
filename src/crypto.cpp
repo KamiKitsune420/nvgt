@@ -14,6 +14,7 @@
 #include "crypto.h"
 #include "aes.hpp"
 #include <string>
+#include <vector>
 #include <cstring>
 #include <sstream>
 #include <rng_get_bytes.h>
@@ -93,6 +94,79 @@ std::string random_bytes(asUINT len) {
 	if (rng_get_bytes((unsigned char *)&ret[0], len) != len)
 		return "";
 	return ret;
+}
+
+// LOCAL CHANGE (Eleutheria): expose Monocypher's key exchange, authenticated encryption and
+// BLAKE2b to scripts, so a game can encrypt its own network traffic. Monocypher was already
+// compiled in for the asset streams below; only these wrappers and their registrations are
+// new. Bad input sizes give an empty string or false rather than throwing, so a malformed
+// key from the network cannot take a script down.
+std::string string_x25519_secret_key() {
+	return random_bytes(32); // Clamping happens inside Monocypher.
+}
+std::string string_x25519_public_key(const std::string& secret_key) {
+	if (secret_key.size() != 32) return "";
+	uint8_t public_key[32];
+	crypto_x25519_public_key(public_key, (const uint8_t*)secret_key.data());
+	return std::string((const char*)public_key, 32);
+}
+// The raw shared secret. Callers must hash it before using it as a key, and should reject
+// an all-zero result, which a deliberately malformed public key produces.
+std::string string_x25519_shared(const std::string& secret_key, const std::string& their_public_key) {
+	if (secret_key.size() != 32 || their_public_key.size() != 32) return "";
+	uint8_t shared[32];
+	crypto_x25519(shared, (const uint8_t*)secret_key.data(), (const uint8_t*)their_public_key.data());
+	std::string result((const char*)shared, 32);
+	crypto_wipe(shared, 32);
+	return result;
+}
+// XChaCha20-Poly1305. The result is the 16 byte MAC followed by the ciphertext.
+std::string string_aead_encrypt(const std::string& plaintext, const std::string& key, const std::string& nonce, const std::string& additional_data) {
+	if (key.size() != 32 || nonce.size() != 24) return "";
+	std::string sealed(16 + plaintext.size(), '\0');
+	crypto_aead_lock((uint8_t*)sealed.data() + 16, (uint8_t*)sealed.data(), (const uint8_t*)key.data(), (const uint8_t*)nonce.data(), (const uint8_t*)additional_data.data(), additional_data.size(), (const uint8_t*)plaintext.data(), plaintext.size());
+	return sealed;
+}
+// False when the input was altered, cut short, or sealed with a different key or nonce.
+bool string_aead_decrypt(const std::string& sealed, const std::string& key, const std::string& nonce, std::string& plaintext, const std::string& additional_data) {
+	plaintext.clear();
+	if (key.size() != 32 || nonce.size() != 24 || sealed.size() < 16) return false;
+	std::string opened(sealed.size() - 16, '\0');
+	if (crypto_aead_unlock((uint8_t*)opened.data(), (const uint8_t*)sealed.data(), (const uint8_t*)key.data(), (const uint8_t*)nonce.data(), (const uint8_t*)additional_data.data(), additional_data.size(), (const uint8_t*)sealed.data() + 16, opened.size()) != 0)
+		return false;
+	plaintext = opened;
+	return true;
+}
+// BLAKE2b, optionally keyed. hash_size is 1 to 64 bytes, the key at most 64.
+std::string string_blake2b(const std::string& message, asUINT hash_size, const std::string& key) {
+	if (hash_size < 1 || hash_size > 64 || key.size() > 64) return "";
+	uint8_t hash[64];
+	crypto_blake2b_keyed(hash, hash_size, (const uint8_t*)key.data(), key.size(), (const uint8_t*)message.data(), message.size());
+	return std::string((const char*)hash, hash_size);
+}
+
+// LOCAL CHANGE (Conversational): Argon2id password hashing, from the Monocypher already compiled in.
+// memory_kib is the memory cost in KiB (one Argon2 block each), passes the time cost. Single lane, as Monocypher is single threaded.
+// The salt should be random and at least 16 bytes. Out-of-range arguments give an empty string rather than throwing.
+std::string string_argon2id(const std::string& password, const std::string& salt, asUINT memory_kib, asUINT passes, asUINT hash_size) {
+	if (salt.size() < 8 || hash_size < 16 || hash_size > 64 || passes < 1 || memory_kib < 8 || memory_kib > 1048576) return "";
+	std::vector<uint64_t> work_area(size_t(memory_kib) * 128); // 1 KiB per block, kept 8 byte aligned.
+	crypto_argon2_config config;
+	config.algorithm = CRYPTO_ARGON2_ID;
+	config.nb_blocks = memory_kib;
+	config.nb_passes = passes;
+	config.nb_lanes = 1;
+	crypto_argon2_inputs inputs;
+	inputs.pass = (const uint8_t*)password.data();
+	inputs.pass_size = (uint32_t)password.size();
+	inputs.salt = (const uint8_t*)salt.data();
+	inputs.salt_size = (uint32_t)salt.size();
+	uint8_t hash[64];
+	crypto_argon2(hash, hash_size, work_area.data(), config, inputs, crypto_argon2_no_extras);
+	crypto_wipe(work_area.data(), work_area.size() * sizeof(uint64_t));
+	std::string result((const char*)hash, hash_size);
+	crypto_wipe(hash, sizeof(hash));
+	return result;
 }
 
 // Caturria's Monocypher chacha20 asset encrypting iostream implementation
@@ -312,4 +386,13 @@ void RegisterScriptCrypto(asIScriptEngine* engine) {
 	engine->RegisterGlobalFunction(_O("string string_aes_encrypt(const string&in plaintext, string key)"), asFUNCTION(string_aes_encrypt), asCALL_CDECL);
 	engine->RegisterGlobalFunction(_O("string string_aes_decrypt(const string&in ciphertext, string)"), asFUNCTION(string_aes_decrypt), asCALL_CDECL);
 	engine->RegisterGlobalFunction(_O("string random_bytes(uint count)"), asFUNCTION(random_bytes), asCALL_CDECL);
+	// LOCAL CHANGE (Eleutheria): see the Monocypher wrappers above.
+	engine->RegisterGlobalFunction(_O("string string_x25519_secret_key()"), asFUNCTION(string_x25519_secret_key), asCALL_CDECL);
+	engine->RegisterGlobalFunction(_O("string string_x25519_public_key(const string&in secret_key)"), asFUNCTION(string_x25519_public_key), asCALL_CDECL);
+	engine->RegisterGlobalFunction(_O("string string_x25519_shared(const string&in secret_key, const string&in their_public_key)"), asFUNCTION(string_x25519_shared), asCALL_CDECL);
+	engine->RegisterGlobalFunction(_O("string string_aead_encrypt(const string&in plaintext, const string&in key, const string&in nonce, const string&in additional_data = \"\")"), asFUNCTION(string_aead_encrypt), asCALL_CDECL);
+	engine->RegisterGlobalFunction(_O("bool string_aead_decrypt(const string&in sealed, const string&in key, const string&in nonce, string&out plaintext, const string&in additional_data = \"\")"), asFUNCTION(string_aead_decrypt), asCALL_CDECL);
+	engine->RegisterGlobalFunction(_O("string string_blake2b(const string&in message, uint hash_size = 64, const string&in key = \"\")"), asFUNCTION(string_blake2b), asCALL_CDECL);
+	// LOCAL CHANGE (Conversational): see string_argon2id above.
+	engine->RegisterGlobalFunction(_O("string string_argon2id(const string&in password, const string&in salt, uint memory_kib = 19456, uint passes = 2, uint hash_size = 32)"), asFUNCTION(string_argon2id), asCALL_CDECL);
 }
