@@ -185,6 +185,10 @@ bool request_android_permission(const std::string& permission, asIScriptFunction
 	return false;
 }
 bool show_android_toast(const std::string& message, int duration, int gravity, int x_offset, int y_offset) { return false; }
+bool android_start_foreground_service(const std::string& title, const std::string& text) { return false; }
+bool android_stop_foreground_service() { return false; }
+std::string android_get_enabled_accessibility_services() { return ""; }
+bool android_is_package_installed(const std::string& package_name) { return false; }
 std::string get_directory_appdata() {
 	return Path::configHome();
 }
@@ -228,6 +232,10 @@ bool request_android_permission(const std::string& permission, asIScriptFunction
 	}
 	return result;
 }
+bool android_start_foreground_service(const std::string& title, const std::string& text); // android.cpp
+bool android_stop_foreground_service(); // android.cpp
+std::string android_get_enabled_accessibility_services(); // android.cpp
+bool android_is_package_installed(const std::string& package_name); // android.cpp
 bool show_android_toast(const std::string& message, int duration, int gravity, int x_offset, int y_offset) {
 	return SDL_ShowAndroidToast(message.c_str(), duration, gravity, x_offset, y_offset);
 }
@@ -246,6 +254,10 @@ void RegisterXplatform(asIScriptEngine* engine) {
 	engine->RegisterFuncdef("void android_permission_request_callback(string permission, bool granted, string user_data)");
 	engine->RegisterGlobalFunction("bool android_request_permission(const string&in permission, android_permission_request_callback@ callback = null, const string&in callback_data = \"\")", asFUNCTION(request_android_permission), asCALL_CDECL);
 	engine->RegisterGlobalFunction("bool android_show_toast(const string&in message, int duration, int gravity = -1, int x_offset = 0, int y_offset = 0)", asFUNCTION(show_android_toast), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool android_start_foreground_service(const string&in title, const string&in text = \"\")", asFUNCTION(android_start_foreground_service), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool android_stop_foreground_service()", asFUNCTION(android_stop_foreground_service), asCALL_CDECL);
+	engine->RegisterGlobalFunction("string android_get_enabled_accessibility_services()", asFUNCTION(android_get_enabled_accessibility_services), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool android_is_package_installed(const string&in package_name)", asFUNCTION(android_is_package_installed), asCALL_CDECL);
 	engine->SetDefaultAccessMask(NVGT_SUBSYSTEM_GENERAL);
 	engine->RegisterGlobalFunction("int get_ANDROID_SDK_VERSION() property", asFUNCTION(SDL_GetAndroidSDKVersion), asCALL_CDECL);
 	engine->RegisterGlobalFunction("bool get_system_is_chromebook() property", asFUNCTION(SDL_IsChromebook), asCALL_CDECL);

@@ -27,6 +27,10 @@ std::vector<std::string> android_get_tts_engine_packages();
 std::string android_input_box(const std::string& title, const std::string& text, const std::string& default_value);
 bool android_info_box(const std::string& title, const std::string& text, const std::string& value);
 bool android_is_window_active();
+bool android_start_foreground_service(const std::string& title, const std::string& text);
+bool android_stop_foreground_service();
+std::string android_get_enabled_accessibility_services();
+bool android_is_package_installed(const std::string& package_name);
 
 // JNI Helpers
 class JNIException : public std::runtime_error {

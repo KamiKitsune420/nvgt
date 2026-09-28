@@ -108,6 +108,24 @@ public final class DialogUtils {
 		} catch (Exception ignored) { }
 	}
 
+	// The accessibility services that are switched on, as Android stores them: "package/class" entries separated by colons, or "".
+	public static String getEnabledAccessibilityServices(Activity activity) {
+		if (activity == null) return "";
+		String value = android.provider.Settings.Secure.getString(activity.getContentResolver(), android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+		return value == null ? "" : value;
+	}
+
+	// Whether an app is installed. Needs the QUERY_ALL_PACKAGES permission (NVGT's manifest has it) or a matching <queries> entry.
+	public static boolean isPackageInstalled(Activity activity, String packageName) {
+		if (activity == null || packageName == null) return false;
+		try {
+			activity.getPackageManager().getPackageInfo(packageName, 0);
+			return true;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
 	public static boolean isWindowActive(Activity activity) {
 		if (activity == null) return false;
 		PowerManager pm = (PowerManager)activity.getSystemService(Context.POWER_SERVICE);

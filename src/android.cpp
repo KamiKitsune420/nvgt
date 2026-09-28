@@ -191,6 +191,114 @@ bool android_is_window_active() {
 	return result;
 }
 
+// Which accessibility services are switched on ("package/class" entries separated by colons), for example to see whether NVGT Bridge is on.
+std::string android_get_enabled_accessibility_services() {
+	try {
+		android_setup_jni();
+	} catch (...) {
+		return "";
+	}
+	JNIEnv* env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return "";
+	jmethodID mid = env->GetStaticMethodID(DialogUtilsClass, "getEnabledAccessibilityServices", "(Landroid/app/Activity;)Ljava/lang/String;");
+	if (!mid) {
+		env->ExceptionClear();
+		return "";
+	}
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	jstring jresult = (jstring)env->CallStaticObjectMethod(DialogUtilsClass, mid, activity.get());
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return "";
+	}
+	if (!jresult) return "";
+	const char* utf = env->GetStringUTFChars(jresult, nullptr);
+	std::string result = utf ? utf : "";
+	if (utf) env->ReleaseStringUTFChars(jresult, utf);
+	env->DeleteLocalRef(jresult);
+	return result;
+}
+
+bool android_is_package_installed(const std::string& package_name) {
+	try {
+		android_setup_jni();
+	} catch (...) {
+		return false;
+	}
+	JNIEnv* env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return false;
+	jmethodID mid = env->GetStaticMethodID(DialogUtilsClass, "isPackageInstalled", "(Landroid/app/Activity;Ljava/lang/String;)Z");
+	if (!mid) {
+		env->ExceptionClear();
+		return false;
+	}
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	LocalRef<jstring> jname(env, env->NewStringUTF(package_name.c_str()));
+	bool result = env->CallStaticBooleanMethod(DialogUtilsClass, mid, activity.get(), jname.get());
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+
+// Starts or stops com.samtupy.nvgt.ForegroundService: an ongoing notification that keeps the app running (and its network up) in the background.
+bool android_start_foreground_service(const std::string& title, const std::string& text) {
+	try {
+		android_setup_jni();
+	} catch (...) {
+		return false;
+	}
+	JNIEnv* env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return false;
+	LocalRef<jclass> cls(env, env->FindClass("com/samtupy/nvgt/ForegroundService"));
+	if (!cls.get()) {
+		env->ExceptionClear();
+		return false;
+	}
+	jmethodID mid = env->GetStaticMethodID(cls.get(), "start", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)Z");
+	if (!mid) {
+		env->ExceptionClear();
+		return false;
+	}
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	LocalRef<jstring> jtitle(env, env->NewStringUTF(title.c_str()));
+	LocalRef<jstring> jtext(env, env->NewStringUTF(text.c_str()));
+	bool result = env->CallStaticBooleanMethod(cls.get(), mid, activity.get(), jtitle.get(), jtext.get());
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+
+bool android_stop_foreground_service() {
+	try {
+		android_setup_jni();
+	} catch (...) {
+		return false;
+	}
+	JNIEnv* env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return false;
+	LocalRef<jclass> cls(env, env->FindClass("com/samtupy/nvgt/ForegroundService"));
+	if (!cls.get()) {
+		env->ExceptionClear();
+		return false;
+	}
+	jmethodID mid = env->GetStaticMethodID(cls.get(), "stop", "(Landroid/app/Activity;)Z");
+	if (!mid) {
+		env->ExceptionClear();
+		return false;
+	}
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	bool result = env->CallStaticBooleanMethod(cls.get(), mid, activity.get());
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+
 std::vector<std::string> android_get_tts_engine_packages() {
 	try {
 		android_setup_jni();
