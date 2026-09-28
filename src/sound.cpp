@@ -1148,6 +1148,12 @@ protected:
 	mutex spatialization_params_mutex;
 	audio_node_chain* node_chain;
 	audio_node_chain* effects_chain;
+	// Occlusion. environment is what the script set (we hold a reference). env_source is this sound's simulation source in
+	// env_source_owner (also referenced while we have it), which is this mixer's environment or its nearest parent's.
+	sound_environment* environment = nullptr;
+	sound_environment* env_source_owner = nullptr;
+	sound_environment_source* env_source = nullptr;
+	mutex environment_mutex;
 public:
 	mixer_impl(audio_engine *e, bool sound_group = true) : audio_node_impl(nullptr, e), snd(nullptr), shape(nullptr), node_chain(audio_node_chain::create(nullptr, nullptr, e)), effects_chain(nullptr), parent_mixer(nullptr), spatializer(nullptr) {
 		init_sound();
@@ -1164,6 +1170,14 @@ public:
 	}
 	~mixer_impl() {
 		stop();
+		{
+			lock_guard<mutex> env_lock(environment_mutex);
+			if (env_source) env_source_owner->release_source(env_source);
+			if (env_source_owner) env_source_owner->release();
+			if (environment) environment->release();
+			env_source = nullptr;
+			env_source_owner = environment = nullptr;
+		}
 		unique_lock<mutex> lock(spatialization_params_mutex);
 		if (spatializer) {
 			node_chain->remove_node(spatializer);
@@ -1252,6 +1266,66 @@ public:
 		return effects_chain;
 	}
 	audio_node_chain* get_internal_node_chain() override { return node_chain; }
+	void set_environment(sound_environment* env) override {
+		lock_guard<mutex> lock(environment_mutex);
+		if (env == environment) return;
+		if (env) env->add_ref();
+		if (environment) environment->release();
+		environment = env;
+	}
+	sound_environment* get_environment() const override { return environment; }
+	std::atomic<bool> has_occlusion_position {false};
+	std::atomic<float> occlusion_x {0}, occlusion_y {0}, occlusion_z {0};
+	void set_occlusion_position(float x, float y, float z) override {
+		occlusion_x.store(x);
+		occlusion_y.store(y);
+		occlusion_z.store(z);
+		has_occlusion_position.store(true);
+	}
+	void clear_occlusion_position() override { has_occlusion_position.store(false); }
+	bool get_occlusion_position(float& x, float& y, float& z) const override {
+		if (!has_occlusion_position.load()) return false;
+		x = occlusion_x.load();
+		y = occlusion_y.load();
+		z = occlusion_z.load();
+		return true;
+	}
+	float get_occlusion() const override {
+		sound_environment_source* s = env_source;
+		if (!s) return 1.0f;
+		float occlusion, transmission[3];
+		sound_environment_source_get_results(s, occlusion, transmission);
+		return occlusion;
+	}
+	float get_transmission(int band) const override {
+		sound_environment_source* s = env_source;
+		if (!s || band < 0 || band > 2) return 1.0f;
+		float occlusion, transmission[3];
+		sound_environment_source_get_results(s, occlusion, transmission);
+		return transmission[band];
+	}
+	sound_environment* get_effective_environment() const override {
+		if (environment) return environment;
+		return parent_mixer ? parent_mixer->get_effective_environment() : nullptr;
+	}
+	sound_environment_source* get_environment_source() override {
+		// Called from the audio thread, so never wait: if the script is changing the environment right now, keep the current source for this block.
+		if (!environment_mutex.try_lock()) return env_source;
+		sound_environment* env = get_effective_environment();
+		if (env != env_source_owner) {
+			if (env_source) env_source_owner->release_source(env_source);
+			env_source = nullptr;
+			if (env_source_owner) env_source_owner->release();
+			env_source_owner = nullptr;
+			if (env && (env_source = env->create_source())) {
+				env->add_ref();
+				env_source_owner = env;
+			}
+		}
+		sound_environment_source* result = env_source;
+		environment_mutex.unlock();
+		return result;
+	}
 	bool get_spatialization_parameters(audio_spatialization_parameters& params) override {
 		if (!snd || !get_spatialization_enabled() || !spatialization_params_mutex.try_lock()) return false;
 		reactphysics3d::Vector3 listener_pos = get_engine()->get_listener_position(get_listener()), listener_dir = get_direction_to_listener(), pos = get_position_3d();
@@ -2332,6 +2406,12 @@ template<class T> void RegisterSoundsystemMixer(asIScriptEngine *engine, const s
 	engine->RegisterObjectMethod(type.c_str(), "bool set_shape(ref@ shape)", asFUNCTION((virtual_call < T, &T::set_shape, bool, CScriptHandle*>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "ref@ get_shape() const property", asFUNCTION((virtual_call < T, &T::get_shape, CScriptHandle*>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "void set_reverb3d(reverb3d@+ reverb) property", asFUNCTION((virtual_call < T, &T::set_reverb3d, void, reverb3d*>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "void set_environment(sound_environment@+ env) property", asFUNCTION((virtual_call < T, &T::set_environment, void, sound_environment*>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "sound_environment@+ get_environment() const property", asFUNCTION((virtual_call < T, &T::get_environment, sound_environment*>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "float get_occlusion() const property", asFUNCTION((virtual_call < T, &T::get_occlusion, float>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "void set_occlusion_position(float x, float y, float z)", asFUNCTION((virtual_call < T, &T::set_occlusion_position, void, float, float, float>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "void clear_occlusion_position()", asFUNCTION((virtual_call < T, &T::clear_occlusion_position, void>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "float get_transmission(int band) const", asFUNCTION((virtual_call < T, &T::get_transmission, float, int>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "void set_reverb3d_at(reverb3d@+ reverb, reverb3d_placement placement)", asFUNCTION((virtual_call < T, &T::set_reverb3d_at, void, reverb3d*, audio_spatializer_reverb3d_placement>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "reverb3d@+ get_reverb3d() const property", asFUNCTION((virtual_call < T, &T::get_reverb3d, reverb3d*>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "audio_splitter_node@+ get_reverb3d_attachment() const property", asFUNCTION((virtual_call < T, &T::get_reverb3d_attachment, splitter_node*>)), asCALL_CDECL_OBJFIRST);
@@ -2516,7 +2596,43 @@ void RegisterSoundsystemShapes(asIScriptEngine* engine) {
 	engine->RegisterObjectProperty("sound_aabb_shape", "int lower_range", asOFFSET(sound_aabb_shape, lower_range));
 	engine->RegisterObjectProperty("sound_aabb_shape", "int upper_range", asOFFSET(sound_aabb_shape, upper_range));
 }
+// sound_environment (occlusion). Creating one starts Steam Audio if it isn't running; if that fails the script gets an exception.
+static sound_environment* sound_environment_factory() {
+	try {
+		return sound_environment::create();
+	} catch (std::exception& e) {
+		asIScriptContext* ctx = asGetActiveContext();
+		if (ctx) ctx->SetException(e.what());
+		return nullptr;
+	}
+}
+static void RegisterSoundEnvironment(asIScriptEngine* engine) {
+	engine->RegisterObjectType("sound_environment", 0, asOBJ_REF);
+	engine->RegisterObjectBehaviour("sound_environment", asBEHAVE_FACTORY, "sound_environment@ e()", asFUNCTION(sound_environment_factory), asCALL_CDECL);
+	engine->RegisterObjectBehaviour("sound_environment", asBEHAVE_ADDREF, "void f()", asMETHOD(sound_environment, add_ref), asCALL_THISCALL);
+	engine->RegisterObjectBehaviour("sound_environment", asBEHAVE_RELEASE, "void f()", asMETHOD(sound_environment, release), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool add_material(const string&in name, float absorption_low, float absorption_mid, float absorption_high, float scattering, float transmission_low, float transmission_mid, float transmission_high, bool replace_if_existing = false)", asMETHOD(sound_environment, add_material), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool material_exists(const string&in name) const", asMETHOD(sound_environment, material_exists), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "int add_box(const string&in material, float minx, float maxx, float miny, float maxy, float minz, float maxz, bool enabled = true)", asMETHOD(sound_environment, add_box), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool remove_box(int id)", asMETHOD(sound_environment, remove_box), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool set_box_enabled(int id, bool enabled)", asMETHOD(sound_environment, set_box_enabled), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool get_box_enabled(int id) const", asMETHOD(sound_environment, get_box_enabled), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void clear_boxes()", asMETHOD(sound_environment, clear_boxes), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "uint get_box_count() const property", asMETHOD(sound_environment, get_box_count), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void set_occlusion_radius(float radius) property", asMETHOD(sound_environment, set_occlusion_radius), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "float get_occlusion_radius() const property", asMETHOD(sound_environment, get_occlusion_radius), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void set_occlusion_samples(int samples) property", asMETHOD(sound_environment, set_occlusion_samples), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "int get_occlusion_samples() const property", asMETHOD(sound_environment, get_occlusion_samples), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void set_transmission_rays(int rays) property", asMETHOD(sound_environment, set_transmission_rays), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "int get_transmission_rays() const property", asMETHOD(sound_environment, get_transmission_rays), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void set_update_rate(int per_second) property", asMETHOD(sound_environment, set_update_rate), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void set_listener(float x, float y, float z)", asMETHOD(sound_environment, set_listener), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void clear_listener()", asMETHOD(sound_environment, clear_listener), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "int get_update_rate() const property", asMETHOD(sound_environment, get_update_rate), asCALL_THISCALL);
+}
+
 void RegisterSoundsystem(asIScriptEngine *engine) {
+	RegisterSoundEnvironment(engine);
 	engine->RegisterEnum("audio_error_state");
 	engine->RegisterEnumValue("audio_error_state", "AUDIO_ERROR_STATE_SUCCESS", MA_SUCCESS);
 	engine->RegisterEnumValue("audio_error_state", "AUDIO_ERROR_STATE_ERROR", MA_ERROR);

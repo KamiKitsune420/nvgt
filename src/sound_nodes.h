@@ -357,3 +357,49 @@ extern int g_audio_basic_panner;
 extern int g_audio_phonon_hrtf_panner;
 extern int g_audio_basic_attenuator;
 extern int g_audio_phonon_attenuator;
+
+// sound_environment: walls and other geometry that sounds are heard through (occlusion) and muffled by (transmission).
+// Build it from boxes of materials, attach it to a mixer (every 3D sound in that mixer uses it) or to a single sound, and the phonon attenuator
+// quietens and muffles each sound by how much geometry lies between it and the listener. A background thread runs Steam Audio's direct
+// simulation a few times a second; the audio thread only reads its latest results. Unlike the legacy plugin's sound_environment, there are
+// no simulated reflections (they're expensive per source; use reverb3d or a mixer reverb for echo), transmission is actually applied, and
+// occlusion is volumetric by default, so sounds fade in and out of occlusion instead of cutting.
+struct sound_environment_source; // Per sound; created and owned by the environment, see sound_nodes.cpp.
+class sound_environment {
+public:
+	virtual void add_ref() = 0;
+	virtual void release() = 0;
+	// Materials: absorption (unused without reflections, but kept for compatibility), scattering, and how much of each band gets through (0 to 1).
+	virtual bool add_material(const std::string& name, float absorption_low, float absorption_mid, float absorption_high, float scattering, float transmission_low, float transmission_mid, float transmission_high, bool replace_if_existing = false) = 0;
+	virtual bool material_exists(const std::string& name) const = 0;
+	// Boxes: returns an id, or -1 if the material doesn't exist. A disabled box (an open door) is left out of the scene until it's enabled again.
+	virtual int add_box(const std::string& material, float minx, float maxx, float miny, float maxy, float minz, float maxz, bool enabled = true) = 0;
+	virtual bool remove_box(int id) = 0;
+	virtual bool set_box_enabled(int id, bool enabled) = 0;
+	virtual bool get_box_enabled(int id) const = 0;
+	virtual void clear_boxes() = 0;
+	virtual unsigned int get_box_count() const = 0;
+	// Occlusion: sources are spheres of occlusion_radius, sampled with occlusion_samples rays (1 = a single ray, which cuts in and out).
+	virtual void set_occlusion_radius(float radius) = 0;
+	virtual float get_occlusion_radius() const = 0;
+	virtual void set_occlusion_samples(int samples) = 0;
+	virtual int get_occlusion_samples() const = 0;
+	// How many surfaces between source and listener count towards transmission.
+	virtual void set_transmission_rays(int rays) = 0;
+	virtual int get_transmission_rays() const = 0;
+	// The listener's position in this environment's world. Until it's set, the audio engine's listener is used; clear_listener goes back to that.
+	// Set it when sounds are positioned relative to the listener (sound_pool), along with each sound's set_occlusion_position.
+	virtual void set_listener(float x, float y, float z) = 0;
+	virtual void clear_listener() = 0;
+	virtual bool get_listener(float& x, float& y, float& z) const = 0;
+	// Simulations per second.
+	virtual void set_update_rate(int per_second) = 0;
+	virtual int get_update_rate() const = 0;
+	// Used by mixers and the phonon attenuator.
+	virtual sound_environment_source* create_source() = 0; // Returns null if the environment is busy; try again next block.
+	virtual void release_source(sound_environment_source* source) = 0;
+	static sound_environment* create();
+};
+// Per-sound simulation results, for the phonon attenuator. All thread safe.
+void sound_environment_source_set_positions(sound_environment_source* source, float sound_x, float sound_y, float sound_z, float listener_x, float listener_y, float listener_z);
+void sound_environment_source_get_results(sound_environment_source* source, float& occlusion, float transmission[3]);

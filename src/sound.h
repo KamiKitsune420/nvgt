@@ -32,6 +32,8 @@ class audio_node_chain;
 class splitter_node;
 class reverb3d;
 struct audio_spatialization_parameters;
+class sound_environment;
+struct sound_environment_source;
 enum audio_spatializer_reverb3d_placement {
 	prepan,
 	postpan,
@@ -275,6 +277,17 @@ public:
 	virtual audio_node_chain* get_effects_chain() = 0;
 	virtual audio_node_chain* get_internal_node_chain() = 0;
 	virtual bool get_spatialization_parameters(audio_spatialization_parameters& params) = 0;
+	// Occlusion (see sound_environment in sound_nodes.h). A mixer's environment applies to every sound in it that doesn't set its own.
+	virtual void set_environment(sound_environment* env) = 0;
+	virtual sound_environment* get_environment() const = 0;
+	virtual sound_environment* get_effective_environment() const = 0; // This mixer's, or the nearest parent mixer's.
+	virtual sound_environment_source* get_environment_source() = 0; // For the attenuator, on the audio thread. May return null.
+	// Where the sound really is in the environment's world, when set_position_3d is relative to the listener (as sound_pool does).
+	virtual void set_occlusion_position(float x, float y, float z) = 0;
+	virtual void clear_occlusion_position() = 0;
+	virtual bool get_occlusion_position(float& x, float& y, float& z) const = 0;
+	virtual float get_occlusion() const = 0; // Latest simulated occlusion: 1 is clear, 0 fully blocked. 1 without an environment.
+	virtual float get_transmission(int band) const = 0; // How much of a band (0 low, 1 mid, 2 high) gets through what's in the way. 1 without an environment.
 	virtual bool play(bool reset_loop_state = true) = 0;
 	virtual bool play_looped() = 0;
 	virtual bool stop() = 0;

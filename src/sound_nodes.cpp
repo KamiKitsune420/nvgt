@@ -11,8 +11,15 @@
  * 3. This notice may not be removed or altered from any source distribution.
 */
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <exception>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <Poco/NotificationQueue.h>
 #include <Poco/Thread.h>
@@ -165,6 +172,10 @@ public:
 	unsigned int get_node_count() const override { return nodes.size(); }
 };
 audio_node_chain* audio_node_chain::create(audio_node* source, audio_node* endpoint, audio_engine* engine) { return new audio_node_chain_impl(source, endpoint, engine); }
+
+// sound_environment helpers used by the phonon attenuator; defined at the end of this file.
+bool sound_environment_source_ready(sound_environment_source* s);
+bool sound_environment_try_prefill(sound_environment* env, sound_environment_source* s);
 
 static IPLAudioSettings g_phonon_audio_settings {44100, SOUNDSYSTEM_FRAMESIZE}; // We will update samplerate later in phonon_init.
 static IPLContext g_phonon_context = nullptr;
@@ -1026,6 +1037,44 @@ class phonon_attenuator_impl : public spatializer_component_node_impl, public vi
 	IPLDistanceAttenuationModel distanceModel;
 	IPLAirAbsorptionModel airAbsorptionModel;
 public:
+	// Occlusion from a sound_environment, eased towards the simulated values a little each block so changes (a door closing) don't click.
+	float current_occlusion = 1.0f;
+	float current_transmission[3] = {1.0f, 1.0f, 1.0f};
+	bool environment_started = false;
+	static constexpr IPLDirectEffectFlags base_flags = static_cast<IPLDirectEffectFlags>(IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+	// Returns false if this block should be silent: a new sound in an environment waits for its first simulation, rather than blurting out unoccluded.
+	bool apply_environment(const audio_spatialization_parameters& params) {
+		iplEffectParams.flags = base_flags;
+		mixer* mix = spatializer ? spatializer->get_mixer() : nullptr;
+		sound_environment_source* source = mix ? mix->get_environment_source() : nullptr;
+		if (!source) {
+			environment_started = false;
+			return true;
+		}
+		// Positions in the environment's world: the sound's and listener's own overrides if set (sound_pool positions sounds relative to the listener), else where the engine has them.
+		float sx = params.sound_x, sy = params.sound_y, sz = params.sound_z, lx = params.listener_x, ly = params.listener_y, lz = params.listener_z;
+		mix->get_occlusion_position(sx, sy, sz);
+		sound_environment* env = mix->get_effective_environment();
+		if (env) env->get_listener(lx, ly, lz);
+		sound_environment_source_set_positions(source, sx, sy, sz, lx, ly, lz);
+		if (!sound_environment_source_ready(source) && !sound_environment_try_prefill(env, source)) return false;
+		float occlusion, transmission[3];
+		sound_environment_source_get_results(source, occlusion, transmission);
+		if (!environment_started) {
+			current_occlusion = occlusion;
+			for (int i = 0; i < 3; i++) current_transmission[i] = transmission[i];
+			environment_started = true;
+		} else {
+			const float ease = 0.25f;
+			current_occlusion += (occlusion - current_occlusion) * ease;
+			for (int i = 0; i < 3; i++) current_transmission[i] += (transmission[i] - current_transmission[i]) * ease;
+		}
+		iplEffectParams.flags = static_cast<IPLDirectEffectFlags>(base_flags | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+		iplEffectParams.transmissionType = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+		iplEffectParams.occlusion = current_occlusion;
+		for (int i = 0; i < 3; i++) iplEffectParams.transmission[i] = current_transmission[i];
+		return true;
+	}
 	phonon_attenuator_impl(audio_spatializer* spatializer, audio_engine* e) : spatializer_component_node_impl(spatializer, e), iplEffect(nullptr) {
 		if (!phonon_init()) throw std::runtime_error("Steam Audio initialization failed");
 		distanceModel = {};
@@ -1070,6 +1119,10 @@ public:
 		listenerPos = {params.listener_x * params.rolloff, params.listener_y * params.rolloff, params.listener_z * params.rolloff};
 		iplEffectParams.distanceAttenuation = params.listener_distance <= params.max_distance? clamp(iplDistanceAttenuationCalculate(g_phonon_context, sourcePos, listenerPos, &distanceModel), params.min_volume, params.max_volume) : params.min_volume;
 		iplAirAbsorptionCalculate(g_phonon_context, sourcePos, listenerPos, &airAbsorptionModel, iplEffectParams.airAbsorption);
+		if (!apply_environment(params)) {
+			ma_silence_pcm_frames(frames_out[0], totalFramesToProcess, ma_format_f32, get_engine()->get_channels());
+			return;
+		}
 		while (totalFramesProcessed < totalFramesToProcess) {
 			ma_uint32 framesToProcessThisIteration = totalFramesToProcess - totalFramesProcessed;
 			if (framesToProcessThisIteration > (ma_uint32)g_phonon_audio_settings.frameSize) framesToProcessThisIteration = (ma_uint32)g_phonon_audio_settings.frameSize;
@@ -1086,3 +1139,373 @@ public:
 	}
 };
 spatializer_component_node* phonon_attenuator::create(audio_spatializer* spatializer, audio_engine* engine) { return new phonon_attenuator_impl(spatializer, engine); }
+
+// sound_environment: occlusion and transmission for the current sound system (see sound_nodes.h).
+// Added for Conversational on KamiKitsune420/nvgt (not upstream NVGT).
+
+struct sound_environment_source {
+	IPLSource source = nullptr;
+	bool added = false; // Worker thread only.
+	std::atomic<bool> active {true};
+	std::atomic<bool> has_position {false};
+	std::atomic<bool> has_results {false};
+	std::atomic<float> sx {0}, sy {0}, sz {0}, lx {0}, ly {0}, lz {0};
+	std::atomic<float> occlusion {1.0f};
+	std::atomic<float> transmission[3] = {1.0f, 1.0f, 1.0f};
+};
+
+void sound_environment_source_set_positions(sound_environment_source* s, float sound_x, float sound_y, float sound_z, float listener_x, float listener_y, float listener_z) {
+	if (!s) return;
+	s->sx.store(sound_x, std::memory_order_relaxed);
+	s->sy.store(sound_y, std::memory_order_relaxed);
+	s->sz.store(sound_z, std::memory_order_relaxed);
+	s->lx.store(listener_x, std::memory_order_relaxed);
+	s->ly.store(listener_y, std::memory_order_relaxed);
+	s->lz.store(listener_z, std::memory_order_relaxed);
+	s->has_position.store(true, std::memory_order_release);
+}
+bool sound_environment_source_ready(sound_environment_source* s) { return s && s->has_results.load(std::memory_order_acquire); }
+void sound_environment_source_get_results(sound_environment_source* s, float& occlusion, float transmission[3]) {
+	occlusion = s->occlusion.load(std::memory_order_relaxed);
+	for (int i = 0; i < 3; i++) transmission[i] = s->transmission[i].load(std::memory_order_relaxed);
+}
+
+class sound_environment_impl : public sound_environment {
+	struct box {
+		std::string material;
+		float bounds[6];
+		bool enabled = true;
+		bool removed = false;
+		IPLStaticMesh mesh = nullptr;
+	};
+	struct cached_result {
+		float occlusion;
+		float transmission[3];
+	};
+	std::atomic<int> ref_count {1};
+	IPLScene scene = nullptr;
+	IPLSimulator sim = nullptr;
+	std::unordered_map<std::string, IPLMaterial> materials;
+	std::vector<box> boxes;
+	std::vector<std::unique_ptr<sound_environment_source>> sources;
+	// Recent results by (sound tile, listener tile), so a new sound where one just played (another footstep) starts with the right occlusion.
+	std::unordered_map<uint64_t, cached_result> cache;
+	mutable std::mutex m;
+	std::condition_variable wake;
+	std::thread worker;
+	bool running = true;
+	bool scene_dirty = false;
+	bool sim_dirty = true;
+	bool wake_requested = false;
+	float occlusion_radius = 0.5f;
+	int occlusion_samples = 16;
+	int transmission_rays = 3;
+	int update_rate = 20;
+	static const int max_occlusion_samples = 64;
+
+	static uint64_t cache_key(float sx, float sy, float sz, float lx, float ly, float lz) {
+		int v[6] = {int(floorf(sx)), int(floorf(sy)), int(floorf(sz)), int(floorf(lx)), int(floorf(ly)), int(floorf(lz))};
+		uint64_t h = 1469598103934665603ULL;
+		for (int i = 0; i < 6; i++) {
+			h ^= uint64_t(uint32_t(v[i]));
+			h *= 1099511628211ULL;
+		}
+		return h;
+	}
+	bool make_mesh(box& b) {
+		auto it = materials.find(b.material);
+		if (it == materials.end()) return false;
+		float minx = b.bounds[0], maxx = b.bounds[1], miny = b.bounds[2], maxy = b.bounds[3], minz = b.bounds[4], maxz = b.bounds[5];
+		IPLVector3 vertices[8] = {{minx, miny, minz}, {maxx, miny, minz}, {maxx, maxy, minz}, {minx, maxy, minz}, {minx, miny, maxz}, {maxx, miny, maxz}, {maxx, maxy, maxz}, {minx, maxy, maxz}};
+		IPLTriangle triangles[12] = {{0, 2, 1}, {0, 3, 2}, {0, 1, 5}, {0, 5, 4}, {1, 2, 6}, {1, 6, 5}, {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7}, {4, 5, 6}, {4, 6, 7}};
+		IPLint32 material_indices[12] = {0};
+		IPLMaterial material = it->second;
+		IPLStaticMeshSettings settings {8, 12, 1, vertices, triangles, material_indices, &material};
+		if (iplStaticMeshCreate(scene, &settings, &b.mesh) != IPL_STATUS_SUCCESS) {
+			b.mesh = nullptr;
+			return false;
+		}
+		iplStaticMeshAdd(b.mesh, scene);
+		scene_dirty = true;
+		return true;
+	}
+	void drop_mesh(box& b) {
+		if (!b.mesh) return;
+		iplStaticMeshRemove(b.mesh, scene);
+		iplStaticMeshRelease(&b.mesh);
+		b.mesh = nullptr;
+		scene_dirty = true;
+	}
+	void run() {
+		std::unique_lock<std::mutex> lock(m);
+		while (running) {
+			if (scene_dirty) {
+				iplSceneCommit(scene);
+				scene_dirty = false;
+				sim_dirty = true;
+				cache.clear(); // Walls changed (a door opened), so old results are wrong.
+			}
+			for (auto it = sources.begin(); it != sources.end();) {
+				sound_environment_source* s = it->get();
+				if (s->active.load()) {
+					if (!s->added) {
+						iplSourceAdd(s->source, sim);
+						s->added = true;
+						sim_dirty = true;
+					}
+					++it;
+					continue;
+				}
+				if (s->added) iplSourceRemove(s->source, sim);
+				iplSourceRelease(&s->source);
+				it = sources.erase(it);
+				sim_dirty = true;
+			}
+			if (sim_dirty) {
+				iplSimulatorCommit(sim);
+				sim_dirty = false;
+			}
+			bool have_listener = false;
+			IPLVector3 listener {0, 0, 0};
+			for (auto& s : sources) {
+				if (!s->added || !s->has_position.load(std::memory_order_acquire)) continue;
+				if (!have_listener) {
+					listener = IPLVector3 {s->lx.load(), s->ly.load(), s->lz.load()};
+					have_listener = true;
+				}
+				IPLSimulationInputs inputs {};
+				inputs.flags = IPL_SIMULATIONFLAGS_DIRECT;
+				inputs.directFlags = IPLDirectSimulationFlags(IPL_DIRECTSIMULATIONFLAGS_OCCLUSION | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+				inputs.source = IPLCoordinateSpace3 {IPLVector3 {1, 0, 0}, IPLVector3 {0, 0, 1}, IPLVector3 {0, 1, 0}, IPLVector3 {s->sx.load(), s->sy.load(), s->sz.load()}};
+				inputs.occlusionType = occlusion_samples > 1 ? IPL_OCCLUSIONTYPE_VOLUMETRIC : IPL_OCCLUSIONTYPE_RAYCAST;
+				inputs.occlusionRadius = occlusion_radius;
+				inputs.numOcclusionSamples = occlusion_samples;
+				inputs.numTransmissionRays = transmission_rays;
+				iplSourceSetInputs(s->source, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+			}
+			if (have_listener) {
+				IPLSimulationSharedInputs shared {};
+				shared.listener = IPLCoordinateSpace3 {IPLVector3 {1, 0, 0}, IPLVector3 {0, 0, 1}, IPLVector3 {0, 1, 0}, listener};
+				iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &shared);
+				iplSimulatorRunDirect(sim);
+				for (auto& s : sources) {
+					if (!s->added || !s->has_position.load(std::memory_order_acquire)) continue;
+					IPLSimulationOutputs outputs {};
+					iplSourceGetOutputs(s->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+					cached_result r {outputs.direct.occlusion, {outputs.direct.transmission[0], outputs.direct.transmission[1], outputs.direct.transmission[2]}};
+					s->occlusion.store(r.occlusion, std::memory_order_relaxed);
+					for (int i = 0; i < 3; i++) s->transmission[i].store(r.transmission[i], std::memory_order_relaxed);
+					s->has_results.store(true, std::memory_order_release);
+					if (cache.size() > 4096) cache.clear();
+					cache[cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load())] = r;
+				}
+			}
+			wake_requested = false;
+			int rate = update_rate < 1 ? 1 : update_rate;
+			wake.wait_for(lock, std::chrono::milliseconds(1000 / rate), [this] { return !running || wake_requested; });
+		}
+	}
+public:
+	sound_environment_impl() {
+		if (!phonon_init()) throw std::runtime_error("sound_environment needs Steam Audio, which couldn't be started");
+		IPLSceneSettings scene_settings {};
+		scene_settings.type = IPL_SCENETYPE_DEFAULT;
+		if (iplSceneCreate(g_phonon_context, &scene_settings, &scene) != IPL_STATUS_SUCCESS) throw std::runtime_error("couldn't create the sound_environment's scene");
+		IPLSimulationSettings sim_settings {};
+		sim_settings.flags = IPL_SIMULATIONFLAGS_DIRECT;
+		sim_settings.sceneType = IPL_SCENETYPE_DEFAULT;
+		sim_settings.maxNumOcclusionSamples = max_occlusion_samples;
+		sim_settings.maxNumSources = 1024;
+		sim_settings.numThreads = 1;
+		sim_settings.samplingRate = g_phonon_audio_settings.samplingRate;
+		sim_settings.frameSize = g_phonon_audio_settings.frameSize;
+		if (iplSimulatorCreate(g_phonon_context, &sim_settings, &sim) != IPL_STATUS_SUCCESS) {
+			iplSceneRelease(&scene);
+			throw std::runtime_error("couldn't create the sound_environment's simulator");
+		}
+		iplSimulatorSetScene(sim, scene);
+		iplSceneCommit(scene);
+		iplSimulatorCommit(sim);
+		// The legacy plugin's materials, so maps written for it sound the same.
+		add_material("air", 0, 0, 0, 0, 1, 1, 1, false);
+		add_material("generic", 0.10f, 0.20f, 0.30f, 0.05f, 0.100f, 0.050f, 0.030f, false);
+		add_material("brick", 0.03f, 0.04f, 0.07f, 0.05f, 0.015f, 0.015f, 0.015f, false);
+		add_material("concrete", 0.05f, 0.07f, 0.08f, 0.05f, 0.015f, 0.002f, 0.001f, false);
+		add_material("ceramic", 0.01f, 0.02f, 0.02f, 0.05f, 0.060f, 0.044f, 0.011f, false);
+		add_material("gravel", 0.60f, 0.70f, 0.80f, 0.05f, 0.031f, 0.012f, 0.008f, false);
+		add_material("carpet", 0.24f, 0.69f, 0.73f, 0.05f, 0.020f, 0.005f, 0.003f, false);
+		add_material("glass", 0.06f, 0.03f, 0.02f, 0.05f, 0.060f, 0.044f, 0.011f, false);
+		add_material("plaster", 0.12f, 0.06f, 0.04f, 0.05f, 0.056f, 0.056f, 0.004f, false);
+		add_material("wood", 0.11f, 0.07f, 0.06f, 0.05f, 0.070f, 0.014f, 0.005f, false);
+		add_material("metal", 0.20f, 0.07f, 0.06f, 0.05f, 0.200f, 0.025f, 0.010f, false);
+		add_material("rock", 0.13f, 0.20f, 0.24f, 0.05f, 0.015f, 0.002f, 0.001f, false);
+		worker = std::thread(&sound_environment_impl::run, this);
+	}
+	~sound_environment_impl() {
+		{
+			std::lock_guard<std::mutex> lock(m);
+			running = false;
+		}
+		wake.notify_all();
+		if (worker.joinable()) worker.join();
+		for (auto& s : sources) {
+			if (s->added) iplSourceRemove(s->source, sim);
+			iplSourceRelease(&s->source);
+		}
+		sources.clear();
+		for (box& b : boxes) {
+			if (!b.mesh) continue;
+			iplStaticMeshRemove(b.mesh, scene);
+			iplStaticMeshRelease(&b.mesh);
+		}
+		iplSimulatorRelease(&sim);
+		iplSceneRelease(&scene);
+	}
+	void add_ref() override { ref_count.fetch_add(1); }
+	void release() override {
+		if (ref_count.fetch_sub(1) == 1) delete this;
+	}
+	bool add_material(const std::string& name, float absorption_low, float absorption_mid, float absorption_high, float scattering, float transmission_low, float transmission_mid, float transmission_high, bool replace_if_existing) override {
+		std::lock_guard<std::mutex> lock(m);
+		if (!replace_if_existing && materials.find(name) != materials.end()) return false;
+		materials[name] = IPLMaterial {{absorption_low, absorption_mid, absorption_high}, scattering, {transmission_low, transmission_mid, transmission_high}};
+		return true;
+	}
+	bool material_exists(const std::string& name) const override {
+		std::lock_guard<std::mutex> lock(m);
+		return materials.find(name) != materials.end();
+	}
+	int add_box(const std::string& material, float minx, float maxx, float miny, float maxy, float minz, float maxz, bool enabled) override {
+		std::lock_guard<std::mutex> lock(m);
+		if (materials.find(material) == materials.end()) return -1;
+		box b;
+		b.material = material;
+		b.bounds[0] = std::min(minx, maxx);
+		b.bounds[1] = std::max(minx, maxx);
+		b.bounds[2] = std::min(miny, maxy);
+		b.bounds[3] = std::max(miny, maxy);
+		b.bounds[4] = std::min(minz, maxz);
+		b.bounds[5] = std::max(minz, maxz);
+		b.enabled = enabled;
+		if (enabled && !make_mesh(b)) return -1;
+		boxes.push_back(b);
+		return int(boxes.size()) - 1;
+	}
+	bool remove_box(int id) override {
+		std::lock_guard<std::mutex> lock(m);
+		if (id < 0 || id >= int(boxes.size()) || boxes[id].removed) return false;
+		drop_mesh(boxes[id]);
+		boxes[id].removed = true;
+		boxes[id].enabled = false;
+		return true;
+	}
+	bool set_box_enabled(int id, bool enabled) override {
+		std::lock_guard<std::mutex> lock(m);
+		if (id < 0 || id >= int(boxes.size()) || boxes[id].removed) return false;
+		box& b = boxes[id];
+		if (b.enabled == enabled) return true;
+		if (enabled) {
+			if (!make_mesh(b)) return false;
+		} else drop_mesh(b);
+		b.enabled = enabled;
+		wake_requested = true;
+		wake.notify_all();
+		return true;
+	}
+	bool get_box_enabled(int id) const override {
+		std::lock_guard<std::mutex> lock(m);
+		if (id < 0 || id >= int(boxes.size()) || boxes[id].removed) return false;
+		return boxes[id].enabled;
+	}
+	void clear_boxes() override {
+		std::lock_guard<std::mutex> lock(m);
+		for (box& b : boxes) drop_mesh(b);
+		boxes.clear();
+		wake_requested = true;
+		wake.notify_all();
+	}
+	unsigned int get_box_count() const override {
+		std::lock_guard<std::mutex> lock(m);
+		unsigned int count = 0;
+		for (const box& b : boxes)
+			if (!b.removed) count++;
+		return count;
+	}
+	void set_occlusion_radius(float radius) override {
+		std::lock_guard<std::mutex> lock(m);
+		occlusion_radius = radius < 0 ? 0 : radius;
+	}
+	float get_occlusion_radius() const override {
+		std::lock_guard<std::mutex> lock(m);
+		return occlusion_radius;
+	}
+	void set_occlusion_samples(int samples) override {
+		std::lock_guard<std::mutex> lock(m);
+		occlusion_samples = samples < 1 ? 1 : (samples > max_occlusion_samples ? max_occlusion_samples : samples);
+	}
+	int get_occlusion_samples() const override {
+		std::lock_guard<std::mutex> lock(m);
+		return occlusion_samples;
+	}
+	void set_transmission_rays(int rays) override {
+		std::lock_guard<std::mutex> lock(m);
+		transmission_rays = rays < 1 ? 1 : rays;
+	}
+	int get_transmission_rays() const override {
+		std::lock_guard<std::mutex> lock(m);
+		return transmission_rays;
+	}
+	std::atomic<bool> has_listener {false};
+	std::atomic<float> listener_x {0}, listener_y {0}, listener_z {0};
+	void set_listener(float x, float y, float z) override {
+		listener_x.store(x);
+		listener_y.store(y);
+		listener_z.store(z);
+		has_listener.store(true);
+	}
+	void clear_listener() override { has_listener.store(false); }
+	bool get_listener(float& x, float& y, float& z) const override {
+		if (!has_listener.load()) return false;
+		x = listener_x.load();
+		y = listener_y.load();
+		z = listener_z.load();
+		return true;
+	}
+	void set_update_rate(int per_second) override {
+		std::lock_guard<std::mutex> lock(m);
+		update_rate = per_second < 1 ? 1 : (per_second > 200 ? 200 : per_second);
+	}
+	int get_update_rate() const override {
+		std::lock_guard<std::mutex> lock(m);
+		return update_rate;
+	}
+	sound_environment_source* create_source() override {
+		// Called from the audio thread: never wait for the worker.
+		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
+		if (!lock.owns_lock()) return nullptr;
+		auto s = std::make_unique<sound_environment_source>();
+		IPLSourceSettings settings {IPL_SIMULATIONFLAGS_DIRECT};
+		if (iplSourceCreate(sim, &settings, &s->source) != IPL_STATUS_SUCCESS) return nullptr;
+		sound_environment_source* result = s.get();
+		sources.push_back(std::move(s));
+		wake_requested = true;
+		wake.notify_all();
+		return result;
+	}
+	void release_source(sound_environment_source* s) override {
+		if (s) s->active.store(false);
+	}
+	// Gives a new source the result simulated at the same spot recently, if there is one. Audio thread: never waits.
+	bool try_prefill(sound_environment_source* s) {
+		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
+		if (!lock.owns_lock()) return false;
+		auto it = cache.find(cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load()));
+		if (it == cache.end()) return false;
+		s->occlusion.store(it->second.occlusion);
+		for (int i = 0; i < 3; i++) s->transmission[i].store(it->second.transmission[i]);
+		s->has_results.store(true, std::memory_order_release);
+		return true;
+	}
+};
+sound_environment* sound_environment::create() { return new sound_environment_impl(); }
+bool sound_environment_try_prefill(sound_environment* env, sound_environment_source* s) { return env && s && static_cast<sound_environment_impl*>(env)->try_prefill(s); }

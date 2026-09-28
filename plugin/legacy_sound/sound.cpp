@@ -229,7 +229,9 @@ void phonon_dsp(void* buffer, unsigned int length, float x, float y, float z, so
 	iplAudioBufferDownmix(phonon_context, &inbuffer, &mono_inbuffer);
 	if (s.env) {
 		IPLDirectEffectParams dir_params = src_out.direct;
-		dir_params.flags = IPLDirectEffectFlags(IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
+		// Transmission is simulated for every source (see attach()), so apply it too: without it a sound behind a wall was muted instead of muffled.
+		dir_params.flags = IPLDirectEffectFlags(IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION | IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION | IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+		dir_params.transmissionType = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
 		iplDirectEffectApply(s.direct_effect, &dir_params, &mono_inbuffer, &mono_tmp_buffer);
 	}
 	if ((x != 0 || y != 0 || z != 0) && s.hrtf_effect) {
