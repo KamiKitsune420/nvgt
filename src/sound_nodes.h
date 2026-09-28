@@ -387,6 +387,14 @@ public:
 	// How many surfaces between source and listener count towards transmission.
 	virtual void set_transmission_rays(int rays) = 0;
 	virtual int get_transmission_rays() const = 0;
+	// Portals: openings (doorways) sound can come round through when the straight line is blocked. A blocked sound that can be seen
+	// from a portal the listener can see is heard through that portal: duller the sharper the bend, and from the portal's direction
+	// (see sound.get_portal_route). radius is about half the opening's width. Disable a portal when its door closes.
+	virtual int add_portal(float x, float y, float z, float radius) = 0;
+	virtual bool remove_portal(int id) = 0;
+	virtual bool set_portal_enabled(int id, bool enabled) = 0;
+	virtual bool get_portal_enabled(int id) const = 0;
+	virtual unsigned int get_portal_count() const = 0;
 	// The listener's position in this environment's world. Until it's set, the audio engine's listener is used; clear_listener goes back to that.
 	// Set it when sounds are positioned relative to the listener (sound_pool), along with each sound's set_occlusion_position.
 	virtual void set_listener(float x, float y, float z) = 0;
@@ -403,3 +411,5 @@ public:
 // Per-sound simulation results, for the phonon attenuator. All thread safe.
 void sound_environment_source_set_positions(sound_environment_source* source, float sound_x, float sound_y, float sound_z, float listener_x, float listener_y, float listener_z);
 void sound_environment_source_get_results(sound_environment_source* source, float& occlusion, float transmission[3]);
+// The route through a portal, if the sound is currently heard that way: the portal's position and the total distance listener to portal to sound.
+bool sound_environment_source_get_route(sound_environment_source* source, float& x, float& y, float& z, float& distance);

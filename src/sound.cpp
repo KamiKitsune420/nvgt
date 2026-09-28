@@ -1297,6 +1297,9 @@ public:
 		sound_environment_source_get_results(s, occlusion, transmission);
 		return occlusion;
 	}
+	bool get_portal_route(float& x, float& y, float& z, float& distance) const override {
+		return sound_environment_source_get_route(env_source, x, y, z, distance);
+	}
 	float get_transmission(int band) const override {
 		sound_environment_source* s = env_source;
 		if (!s || band < 0 || band > 2) return 1.0f;
@@ -2411,6 +2414,7 @@ template<class T> void RegisterSoundsystemMixer(asIScriptEngine *engine, const s
 	engine->RegisterObjectMethod(type.c_str(), "float get_occlusion() const property", asFUNCTION((virtual_call < T, &T::get_occlusion, float>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "void set_occlusion_position(float x, float y, float z)", asFUNCTION((virtual_call < T, &T::set_occlusion_position, void, float, float, float>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "void clear_occlusion_position()", asFUNCTION((virtual_call < T, &T::clear_occlusion_position, void>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "bool get_portal_route(float &out x, float &out y, float &out z, float &out distance) const", asFUNCTION((virtual_call < T, &T::get_portal_route, bool, float&, float&, float&, float&>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "float get_transmission(int band) const", asFUNCTION((virtual_call < T, &T::get_transmission, float, int>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "void set_reverb3d_at(reverb3d@+ reverb, reverb3d_placement placement)", asFUNCTION((virtual_call < T, &T::set_reverb3d_at, void, reverb3d*, audio_spatializer_reverb3d_placement>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "reverb3d@+ get_reverb3d() const property", asFUNCTION((virtual_call < T, &T::get_reverb3d, reverb3d*>)), asCALL_CDECL_OBJFIRST);
@@ -2627,6 +2631,11 @@ static void RegisterSoundEnvironment(asIScriptEngine* engine) {
 	engine->RegisterObjectMethod("sound_environment", "int get_transmission_rays() const property", asMETHOD(sound_environment, get_transmission_rays), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "void set_update_rate(int per_second) property", asMETHOD(sound_environment, set_update_rate), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "void set_listener(float x, float y, float z)", asMETHOD(sound_environment, set_listener), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "int add_portal(float x, float y, float z, float radius)", asMETHOD(sound_environment, add_portal), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool remove_portal(int id)", asMETHOD(sound_environment, remove_portal), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool set_portal_enabled(int id, bool enabled)", asMETHOD(sound_environment, set_portal_enabled), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "bool get_portal_enabled(int id) const", asMETHOD(sound_environment, get_portal_enabled), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "uint get_portal_count() const property", asMETHOD(sound_environment, get_portal_count), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "void clear_listener()", asMETHOD(sound_environment, clear_listener), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "int get_update_rate() const property", asMETHOD(sound_environment, get_update_rate), asCALL_THISCALL);
 }

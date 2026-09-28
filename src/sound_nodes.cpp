@@ -176,6 +176,7 @@ audio_node_chain* audio_node_chain::create(audio_node* source, audio_node* endpo
 // sound_environment helpers used by the phonon attenuator; defined at the end of this file.
 bool sound_environment_source_ready(sound_environment_source* s);
 bool sound_environment_try_prefill(sound_environment* env, sound_environment_source* s);
+void sound_environment_source_get_route_bands(sound_environment_source* s, float bands[3]);
 
 static IPLAudioSettings g_phonon_audio_settings {44100, SOUNDSYSTEM_FRAMESIZE}; // We will update samplerate later in phonon_init.
 static IPLContext g_phonon_context = nullptr;
@@ -1058,8 +1059,17 @@ public:
 		if (env) env->get_listener(lx, ly, lz);
 		sound_environment_source_set_positions(source, sx, sy, sz, lx, ly, lz);
 		if (!sound_environment_source_ready(source) && !sound_environment_try_prefill(env, source)) return false;
-		float occlusion, transmission[3];
+		float occlusion, transmission[3], route[3];
 		sound_environment_source_get_results(source, occlusion, transmission);
+		sound_environment_source_get_route_bands(source, route);
+		if (route[1] > 0) {
+			// Steam Audio gives occlusion + (1 - occlusion) * transmission per band. Fold the route in as transmission with occlusion 0.
+			for (int i = 0; i < 3; i++) {
+				float direct = occlusion + (1.0f - occlusion) * transmission[i];
+				transmission[i] = std::min(1.0f, std::max(direct, route[i]));
+			}
+			occlusion = 0;
+		}
 		if (!environment_started) {
 			current_occlusion = occlusion;
 			for (int i = 0; i < 3; i++) current_transmission[i] = transmission[i];
@@ -1152,6 +1162,11 @@ struct sound_environment_source {
 	std::atomic<float> sx {0}, sy {0}, sz {0}, lx {0}, ly {0}, lz {0};
 	std::atomic<float> occlusion {1.0f};
 	std::atomic<float> transmission[3] = {1.0f, 1.0f, 1.0f};
+	// A route round through a portal (doorway), when that carries more sound than the straight line: how much gets there, how dull the bend
+	// makes it (per band), where the portal is, and the total distance listener to portal to sound.
+	std::atomic<bool> via_active {false};
+	std::atomic<float> via_amount {0}, via_x {0}, via_y {0}, via_z {0}, via_distance {0};
+	std::atomic<float> via_eq[3] = {1.0f, 1.0f, 1.0f};
 };
 
 void sound_environment_source_set_positions(sound_environment_source* s, float sound_x, float sound_y, float sound_z, float listener_x, float listener_y, float listener_z) {
@@ -1165,6 +1180,20 @@ void sound_environment_source_set_positions(sound_environment_source* s, float s
 	s->has_position.store(true, std::memory_order_release);
 }
 bool sound_environment_source_ready(sound_environment_source* s) { return s && s->has_results.load(std::memory_order_acquire); }
+bool sound_environment_source_get_route(sound_environment_source* s, float& x, float& y, float& z, float& distance) {
+	if (!s || !s->via_active.load(std::memory_order_acquire)) return false;
+	x = s->via_x.load();
+	y = s->via_y.load();
+	z = s->via_z.load();
+	distance = s->via_distance.load();
+	return true;
+}
+// For the attenuator: how much of each band the portal route carries (0 when there's no route).
+void sound_environment_source_get_route_bands(sound_environment_source* s, float bands[3]) {
+	bool active = s && s->via_active.load(std::memory_order_acquire);
+	float amount = active ? s->via_amount.load() : 0.0f;
+	for (int i = 0; i < 3; i++) bands[i] = active ? amount * s->via_eq[i].load() : 0.0f;
+}
 void sound_environment_source_get_results(sound_environment_source* s, float& occlusion, float transmission[3]) {
 	occlusion = s->occlusion.load(std::memory_order_relaxed);
 	for (int i = 0; i < 3; i++) transmission[i] = s->transmission[i].load(std::memory_order_relaxed);
@@ -1181,7 +1210,19 @@ class sound_environment_impl : public sound_environment {
 	struct cached_result {
 		float occlusion;
 		float transmission[3];
+		bool via_active;
+		float via_amount, via_x, via_y, via_z, via_distance;
+		float via_eq[3];
 	};
+	struct portal {
+		float x, y, z, radius;
+		bool enabled = true;
+		bool removed = false;
+		IPLSource source = nullptr;
+		bool added = false;
+		float visibility = 0; // From the listener, this pass.
+	};
+	std::vector<portal> portals;
 	std::atomic<int> ref_count {1};
 	IPLScene scene = nullptr;
 	IPLSimulator sim = nullptr;
@@ -1236,6 +1277,38 @@ class sound_environment_impl : public sound_environment {
 		b.mesh = nullptr;
 		scene_dirty = true;
 	}
+	void set_source_inputs(IPLSource source, float x, float y, float z, float radius) {
+		IPLSimulationInputs inputs {};
+		inputs.flags = IPL_SIMULATIONFLAGS_DIRECT;
+		inputs.directFlags = IPLDirectSimulationFlags(IPL_DIRECTSIMULATIONFLAGS_OCCLUSION | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+		inputs.source = IPLCoordinateSpace3 {IPLVector3 {1, 0, 0}, IPLVector3 {0, 0, 1}, IPLVector3 {0, 1, 0}, IPLVector3 {x, y, z}};
+		inputs.occlusionType = occlusion_samples > 1 ? IPL_OCCLUSIONTYPE_VOLUMETRIC : IPL_OCCLUSIONTYPE_RAYCAST;
+		inputs.occlusionRadius = radius;
+		inputs.numOcclusionSamples = occlusion_samples;
+		inputs.numTransmissionRays = transmission_rays;
+		iplSourceSetInputs(source, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+	}
+	void run_from(float x, float y, float z) {
+		IPLSimulationSharedInputs shared {};
+		shared.listener = IPLCoordinateSpace3 {IPLVector3 {1, 0, 0}, IPLVector3 {0, 0, 1}, IPLVector3 {0, 1, 0}, IPLVector3 {x, y, z}};
+		iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &shared);
+		iplSimulatorRunDirect(sim);
+	}
+	static float read_occlusion(IPLSource source) {
+		IPLSimulationOutputs outputs {};
+		iplSourceGetOutputs(source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+		return outputs.direct.occlusion;
+	}
+	// How dull a route round a corner is, per band, from the bend at the portal (0 degrees straight on, 90 a right angle): low sound
+	// bends round easily, high sound hardly at all.
+	static void bend_eq(float degrees, float eq[3]) {
+		float k = degrees / 90.0f;
+		if (k < 0) k = 0;
+		if (k > 2) k = 2;
+		eq[0] = std::max(0.2f, 1.0f - 0.15f * k);
+		eq[1] = std::max(0.08f, 1.0f - 0.45f * k);
+		eq[2] = std::max(0.03f, 1.0f - 0.7f * k);
+	}
 	void run() {
 		std::unique_lock<std::mutex> lock(m);
 		while (running) {
@@ -1261,43 +1334,119 @@ class sound_environment_impl : public sound_environment {
 				it = sources.erase(it);
 				sim_dirty = true;
 			}
+			for (portal& p : portals) {
+				bool want = p.enabled && !p.removed;
+				if (want && !p.source) {
+					IPLSourceSettings settings {IPL_SIMULATIONFLAGS_DIRECT};
+					if (iplSourceCreate(sim, &settings, &p.source) != IPL_STATUS_SUCCESS) p.source = nullptr;
+				}
+				if (want && p.source && !p.added) {
+					iplSourceAdd(p.source, sim);
+					p.added = true;
+					sim_dirty = true;
+				} else if (!want && p.added) {
+					iplSourceRemove(p.source, sim);
+					p.added = false;
+					sim_dirty = true;
+				}
+			}
 			if (sim_dirty) {
 				iplSimulatorCommit(sim);
 				sim_dirty = false;
 			}
 			bool have_listener = false;
 			IPLVector3 listener {0, 0, 0};
-			for (auto& s : sources) {
-				if (!s->added || !s->has_position.load(std::memory_order_acquire)) continue;
+			for (auto& src : sources) {
+				if (!src->added || !src->has_position.load(std::memory_order_acquire)) continue;
 				if (!have_listener) {
-					listener = IPLVector3 {s->lx.load(), s->ly.load(), s->lz.load()};
+					listener = IPLVector3 {src->lx.load(), src->ly.load(), src->lz.load()};
 					have_listener = true;
 				}
-				IPLSimulationInputs inputs {};
-				inputs.flags = IPL_SIMULATIONFLAGS_DIRECT;
-				inputs.directFlags = IPLDirectSimulationFlags(IPL_DIRECTSIMULATIONFLAGS_OCCLUSION | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
-				inputs.source = IPLCoordinateSpace3 {IPLVector3 {1, 0, 0}, IPLVector3 {0, 0, 1}, IPLVector3 {0, 1, 0}, IPLVector3 {s->sx.load(), s->sy.load(), s->sz.load()}};
-				inputs.occlusionType = occlusion_samples > 1 ? IPL_OCCLUSIONTYPE_VOLUMETRIC : IPL_OCCLUSIONTYPE_RAYCAST;
-				inputs.occlusionRadius = occlusion_radius;
-				inputs.numOcclusionSamples = occlusion_samples;
-				inputs.numTransmissionRays = transmission_rays;
-				iplSourceSetInputs(s->source, IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+				set_source_inputs(src->source, src->sx.load(), src->sy.load(), src->sz.load(), occlusion_radius);
 			}
+			for (portal& p : portals)
+				if (p.added) set_source_inputs(p.source, p.x, p.y, p.z, p.radius);
 			if (have_listener) {
-				IPLSimulationSharedInputs shared {};
-				shared.listener = IPLCoordinateSpace3 {IPLVector3 {1, 0, 0}, IPLVector3 {0, 0, 1}, IPLVector3 {0, 1, 0}, listener};
-				iplSimulatorSetSharedInputs(sim, IPL_SIMULATIONFLAGS_DIRECT, &shared);
-				iplSimulatorRunDirect(sim);
-				for (auto& s : sources) {
-					if (!s->added || !s->has_position.load(std::memory_order_acquire)) continue;
+				// 1: from the listener. Straight-line results for every sound, and which portals the listener can see.
+				run_from(listener.x, listener.y, listener.z);
+				std::vector<cached_result> results(sources.size());
+				bool any_blocked = false;
+				for (size_t i = 0; i < sources.size(); i++) {
+					sound_environment_source* src = sources[i].get();
+					if (!src->added || !src->has_position.load(std::memory_order_acquire)) continue;
 					IPLSimulationOutputs outputs {};
-					iplSourceGetOutputs(s->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
-					cached_result r {outputs.direct.occlusion, {outputs.direct.transmission[0], outputs.direct.transmission[1], outputs.direct.transmission[2]}};
-					s->occlusion.store(r.occlusion, std::memory_order_relaxed);
-					for (int i = 0; i < 3; i++) s->transmission[i].store(r.transmission[i], std::memory_order_relaxed);
-					s->has_results.store(true, std::memory_order_release);
+					iplSourceGetOutputs(src->source, IPL_SIMULATIONFLAGS_DIRECT, &outputs);
+					cached_result& r = results[i];
+					r.occlusion = outputs.direct.occlusion;
+					for (int b = 0; b < 3; b++) r.transmission[b] = outputs.direct.transmission[b];
+					r.via_active = false;
+					r.via_amount = 0;
+					r.via_distance = 0;
+					if (r.occlusion < 0.9f) any_blocked = true;
+				}
+				for (portal& p : portals) p.visibility = p.added ? read_occlusion(p.source) : 0.0f;
+				// 2: from each portal the listener can see, for the sounds the straight line doesn't reach well.
+				if (any_blocked) {
+					for (portal& p : portals) {
+						if (!p.added || p.visibility < 0.25f) continue;
+						run_from(p.x, p.y, p.z);
+						for (size_t i = 0; i < sources.size(); i++) {
+							sound_environment_source* src = sources[i].get();
+							cached_result& r = results[i];
+							if (!src->added || !src->has_position.load(std::memory_order_acquire) || r.occlusion >= 0.9f) continue;
+							float seen = read_occlusion(src->source);
+							float amount = p.visibility * seen;
+							if (amount < 0.05f) continue;
+							float sx = src->sx.load(), sy = src->sy.load(), sz = src->sz.load();
+							// The bend at the portal: between listener-to-portal and portal-to-sound.
+							float ax = p.x - listener.x, ay = p.y - listener.y, az = p.z - listener.z;
+							float bx = sx - p.x, by = sy - p.y, bz = sz - p.z;
+							float la = sqrtf(ax * ax + ay * ay + az * az), lb = sqrtf(bx * bx + by * by + bz * bz);
+							float degrees = 0;
+							if (la > 0.001f && lb > 0.001f) {
+								float c = (ax * bx + ay * by + az * bz) / (la * lb);
+								c = c < -1 ? -1 : (c > 1 ? 1 : c);
+								degrees = acosf(c) * 57.29578f;
+							}
+							float eq[3];
+							bend_eq(degrees, eq);
+							float route_distance = la + lb;
+							// Pick the route that carries the most mid-band sound, shorter routes winning ties.
+							float score = amount * eq[1] / (1.0f + route_distance * 0.05f);
+							float best = r.via_amount > 0 ? r.via_amount * r.via_eq[1] / (1.0f + r.via_distance * 0.05f) : 0;
+							if (score <= best) continue;
+							r.via_amount = amount;
+							for (int b = 0; b < 3; b++) r.via_eq[b] = eq[b];
+							r.via_x = p.x;
+							r.via_y = p.y;
+							r.via_z = p.z;
+							r.via_distance = route_distance;
+						}
+					}
+				}
+				// Publish. A route is used when it carries clearly more than the wall does, with some hysteresis so it doesn't flicker.
+				for (size_t i = 0; i < sources.size(); i++) {
+					sound_environment_source* src = sources[i].get();
+					if (!src->added || !src->has_position.load(std::memory_order_acquire)) continue;
+					cached_result& r = results[i];
+					float direct_mid = r.occlusion + (1.0f - r.occlusion) * r.transmission[1];
+					float via_mid = r.via_amount * r.via_eq[1];
+					bool was_active = src->via_active.load();
+					r.via_active = r.via_amount > 0 && via_mid > direct_mid * (was_active ? 0.8f : 1.25f);
+					src->occlusion.store(r.occlusion, std::memory_order_relaxed);
+					for (int b = 0; b < 3; b++) src->transmission[b].store(r.transmission[b], std::memory_order_relaxed);
+					if (r.via_active) {
+						src->via_amount.store(r.via_amount);
+						for (int b = 0; b < 3; b++) src->via_eq[b].store(r.via_eq[b]);
+						src->via_x.store(r.via_x);
+						src->via_y.store(r.via_y);
+						src->via_z.store(r.via_z);
+						src->via_distance.store(r.via_distance);
+					}
+					src->via_active.store(r.via_active, std::memory_order_release);
+					src->has_results.store(true, std::memory_order_release);
 					if (cache.size() > 4096) cache.clear();
-					cache[cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load())] = r;
+					cache[cache_key(src->sx.load(), src->sy.load(), src->sz.load(), src->lx.load(), src->ly.load(), src->lz.load())] = r;
 				}
 			}
 			wake_requested = false;
@@ -1353,6 +1502,11 @@ public:
 			iplSourceRelease(&s->source);
 		}
 		sources.clear();
+		for (portal& p : portals) {
+			if (!p.source) continue;
+			if (p.added) iplSourceRemove(p.source, sim);
+			iplSourceRelease(&p.source);
+		}
 		for (box& b : boxes) {
 			if (!b.mesh) continue;
 			iplStaticMeshRemove(b.mesh, scene);
@@ -1455,6 +1609,48 @@ public:
 		std::lock_guard<std::mutex> lock(m);
 		return transmission_rays;
 	}
+	int add_portal(float x, float y, float z, float radius) override {
+		std::lock_guard<std::mutex> lock(m);
+		portal p;
+		p.x = x;
+		p.y = y;
+		p.z = z;
+		p.radius = radius < 0.1f ? 0.1f : radius;
+		portals.push_back(p);
+		cache.clear();
+		wake_requested = true;
+		wake.notify_all();
+		return int(portals.size()) - 1;
+	}
+	bool remove_portal(int id) override {
+		std::lock_guard<std::mutex> lock(m);
+		if (id < 0 || id >= int(portals.size()) || portals[id].removed) return false;
+		portals[id].removed = true;
+		cache.clear();
+		wake_requested = true;
+		wake.notify_all();
+		return true;
+	}
+	bool set_portal_enabled(int id, bool enabled) override {
+		std::lock_guard<std::mutex> lock(m);
+		if (id < 0 || id >= int(portals.size()) || portals[id].removed) return false;
+		portals[id].enabled = enabled;
+		cache.clear();
+		wake_requested = true;
+		wake.notify_all();
+		return true;
+	}
+	bool get_portal_enabled(int id) const override {
+		std::lock_guard<std::mutex> lock(m);
+		return id >= 0 && id < int(portals.size()) && !portals[id].removed && portals[id].enabled;
+	}
+	unsigned int get_portal_count() const override {
+		std::lock_guard<std::mutex> lock(m);
+		unsigned int count = 0;
+		for (const portal& p : portals)
+			if (!p.removed) count++;
+		return count;
+	}
 	std::atomic<bool> has_listener {false};
 	std::atomic<float> listener_x {0}, listener_y {0}, listener_z {0};
 	void set_listener(float x, float y, float z) override {
@@ -1501,8 +1697,18 @@ public:
 		if (!lock.owns_lock()) return false;
 		auto it = cache.find(cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load()));
 		if (it == cache.end()) return false;
-		s->occlusion.store(it->second.occlusion);
-		for (int i = 0; i < 3; i++) s->transmission[i].store(it->second.transmission[i]);
+		const cached_result& r = it->second;
+		s->occlusion.store(r.occlusion);
+		for (int i = 0; i < 3; i++) s->transmission[i].store(r.transmission[i]);
+		if (r.via_active) {
+			s->via_amount.store(r.via_amount);
+			for (int i = 0; i < 3; i++) s->via_eq[i].store(r.via_eq[i]);
+			s->via_x.store(r.via_x);
+			s->via_y.store(r.via_y);
+			s->via_z.store(r.via_z);
+			s->via_distance.store(r.via_distance);
+		}
+		s->via_active.store(r.via_active, std::memory_order_release);
 		s->has_results.store(true, std::memory_order_release);
 		return true;
 	}
