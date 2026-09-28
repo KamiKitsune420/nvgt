@@ -1,0 +1,36 @@
+# Builds NVGT for Linux only, for Conversational's Linux server. Started by hand (Actions tab, or gh workflow run linux_stub).
+# Unlike release.yml, it doesn't generate user/nvgt_config.h, so the build uses NVGT's default bytecode settings (src/nvgt_config.h).
+# That's what our Windows nvgt.exe uses, so a server compiled on Windows with -p linux loads on the Linux stub from here.
+# (release.yml makes random bytecode keys for every run, and a script compiled with any other build fails to load with exit code 65.)
+name: linux_stub
+on:
+  workflow_dispatch:
+jobs:
+  linux_build:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        submodules: true
+    - uses: actions/cache@v4
+      with:
+        path: lindev
+        # The same key as release.yml, so the Linux libraries it built are reused instead of rebuilt.
+        key: lindev-${{ hashFiles('vcpkg/ports/**', 'vcpkg/triplets/**', 'vcpkg/*.json', '.git/modules/vcpkg/bin/HEAD') }}
+      id: cache
+    - name: build dependencies
+      if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+      run: |
+        sudo apt update
+        sudo apt full-upgrade -y
+        sudo apt install -y build-essential libtool mesa-common-dev libxext-dev libxcursor-dev ladspa-sdk libxcomposite-dev libsystemd-dev autoconf libxxf86vm-dev libgl1-mesa-dev libxinerama-dev libx11-dev libltdl-dev libgtk-4-dev libglib2.0-dev libspeechd-dev libudev-dev linux-libc-dev libxrandr-dev libxrender-dev libwayland-dev pkg-config xorg-dev libglu1-mesa-dev libxft-dev libgsasl-dev clang python3-jinja2 zip gcc-aarch64-linux-gnu g++-aarch64-linux-gnu autoconf autoconf-archive automake libtool
+        python3 vcpkg/build_dependencies.py --archive
+    - name: build
+      run: |
+        pip3 install scons
+        sudo chmod +x build/build_linux.sh
+        ./build/build_linux.sh ci
+    - uses: actions/upload-artifact@v7
+      with:
+        name: linux_stub
+        path: 'release'
