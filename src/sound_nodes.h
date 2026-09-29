@@ -403,6 +403,12 @@ public:
 	// Simulations per second.
 	virtual void set_update_rate(int per_second) = 0;
 	virtual int get_update_rate() const = 0;
+	// Muffling through walls: a low-pass filter on top of the transmission bands. Three broad bands (split at 800 Hz and 8 kHz) can only tilt a
+	// sound, but a wall stops high sound far more than low, so on their own a sound behind a wall is just quieter, not behind a wall. The
+	// cutoff goes from this frequency (when nothing high gets through) up to fully open (when as much high gets through as low). 0 turns it off.
+	// Sound coming round through a portal isn't filtered: the bend's own bands already dull it about right.
+	virtual void set_muffle_frequency(float hz) = 0;
+	virtual float get_muffle_frequency() const = 0;
 	// Used by mixers and the phonon attenuator.
 	virtual sound_environment_source* create_source() = 0; // Returns null if the environment is busy; try again next block.
 	virtual void release_source(sound_environment_source* source) = 0;

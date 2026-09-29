@@ -2638,6 +2638,8 @@ static void RegisterSoundEnvironment(asIScriptEngine* engine) {
 	engine->RegisterObjectMethod("sound_environment", "uint get_portal_count() const property", asMETHOD(sound_environment, get_portal_count), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "void clear_listener()", asMETHOD(sound_environment, clear_listener), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "int get_update_rate() const property", asMETHOD(sound_environment, get_update_rate), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "void set_muffle_frequency(float hz) property", asMETHOD(sound_environment, set_muffle_frequency), asCALL_THISCALL);
+	engine->RegisterObjectMethod("sound_environment", "float get_muffle_frequency() const property", asMETHOD(sound_environment, get_muffle_frequency), asCALL_THISCALL);
 }
 
 void RegisterSoundsystem(asIScriptEngine *engine) {

@@ -21,6 +21,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 #include <Poco/NotificationQueue.h>
 #include <Poco/Thread.h>
 #include <ma_reverb_node.h>
@@ -1042,6 +1043,44 @@ public:
 	float current_occlusion = 1.0f;
 	float current_transmission[3] = {1.0f, 1.0f, 1.0f};
 	bool environment_started = false;
+	// Muffling through walls (see sound_environment::set_muffle_frequency): a two-pole Butterworth low-pass after the direct effect, whose
+	// cutoff follows how much less high sound than low gets through the walls in the way. Written out here, rather than a miniaudio filter,
+	// so the audio thread never allocates. The cutoff eases like the bands do (in octaves), and the coefficients follow it each block.
+	bool muffling = false;
+	float current_log_cutoff = 0;
+	float lp_b0 = 1, lp_b1 = 0, lp_b2 = 0, lp_a1 = 0, lp_a2 = 0;
+	std::vector<float> lp_z1, lp_z2;
+	void set_muffle_cutoff(float hz, bool snap) {
+		float target = logf(hz);
+		current_log_cutoff = snap ? target : current_log_cutoff + (target - current_log_cutoff) * 0.25f;
+		float sample_rate = float(get_engine()->get_sample_rate());
+		float w0 = 2.0f * 3.14159265f * expf(current_log_cutoff) / sample_rate;
+		float cosw = cosf(w0), alpha = sinf(w0) / (2.0f * 0.70710678f), a0 = 1.0f + alpha;
+		lp_b0 = lp_b2 = (1.0f - cosw) / 2.0f / a0;
+		lp_b1 = (1.0f - cosw) / a0;
+		lp_a1 = -2.0f * cosw / a0;
+		lp_a2 = (1.0f - alpha) / a0;
+		if (snap) std::fill(lp_z1.begin(), lp_z1.end(), 0.0f), std::fill(lp_z2.begin(), lp_z2.end(), 0.0f);
+	}
+	void apply_muffling(float* frames, ma_uint32 frame_count) {
+		size_t channels = lp_z1.size();
+		for (ma_uint32 f = 0; f < frame_count; f++) {
+			for (size_t c = 0; c < channels; c++) {
+				float x = frames[f * channels + c];
+				float y = lp_b0 * x + lp_z1[c];
+				lp_z1[c] = lp_b1 * x - lp_a1 * y + lp_z2[c];
+				lp_z2[c] = lp_b2 * x - lp_a2 * y;
+				frames[f * channels + c] = y;
+			}
+		}
+	}
+	// The cutoff for how much high sound gets through compared to low: the muffle frequency when none does, fully open when as much does.
+	float muffle_cutoff_for(float ratio, float muffle_hz) {
+		float top = std::min(20000.0f, 0.45f * float(get_engine()->get_sample_rate()));
+		if (muffle_hz <= 0 || muffle_hz >= top) return top;
+		ratio = ratio < 0 ? 0 : (ratio > 1 ? 1 : ratio);
+		return muffle_hz * powf(top / muffle_hz, ratio);
+	}
 	static constexpr IPLDirectEffectFlags base_flags = static_cast<IPLDirectEffectFlags>(IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION | IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
 	// Returns false if this block should be silent: a new sound in an environment waits for its first simulation, rather than blurting out unoccluded.
 	bool apply_environment(const audio_spatialization_parameters& params) {
@@ -1050,6 +1089,7 @@ public:
 		sound_environment_source* source = mix ? mix->get_environment_source() : nullptr;
 		if (!source) {
 			environment_started = false;
+			muffling = false;
 			return true;
 		}
 		// Positions in the environment's world: the sound's and listener's own overrides if set (sound_pool positions sounds relative to the listener), else where the engine has them.
@@ -1062,6 +1102,16 @@ public:
 		float occlusion, transmission[3], route[3];
 		sound_environment_source_get_results(source, occlusion, transmission);
 		sound_environment_source_get_route_bands(source, route);
+		// How much high sound the walls let through compared to low. Round through a portal there's no wall muffling: the route's bands are the bend.
+		float high_to_low = 1.0f;
+		if (route[1] <= 0) {
+			float low = occlusion + (1.0f - occlusion) * transmission[0], high = occlusion + (1.0f - occlusion) * transmission[2];
+			if (low > 0.0001f) high_to_low = high / low;
+		}
+		float muffle_hz = env ? env->get_muffle_frequency() : 0.0f;
+		bool was_muffling = muffling;
+		muffling = muffle_hz > 0;
+		if (muffling) set_muffle_cutoff(muffle_cutoff_for(high_to_low, muffle_hz), !environment_started || !was_muffling);
 		if (route[1] > 0) {
 			// Steam Audio gives occlusion + (1 - occlusion) * transmission per band. Fold the route in as transmission with occlusion 0.
 			for (int i = 0; i < 3; i++) {
@@ -1099,6 +1149,8 @@ public:
 		iplEffectParams.directivity = 1.0f;
 		if (iplDirectEffectCreate(g_phonon_context, &g_phonon_audio_settings, &effectSettings, &iplEffect) != IPL_STATUS_SUCCESS) throw std::runtime_error("Failed to create direct effect");
 		ma_uint32 channelsIn = e->get_channels();
+		lp_z1.assign(channelsIn, 0.0f);
+		lp_z2.assign(channelsIn, 0.0f);
 		if (iplAudioBufferAllocate(g_phonon_context, channelsIn, g_phonon_audio_settings.frameSize, &inputBuffer) != IPL_STATUS_SUCCESS) {
 			iplDirectEffectRelease(&iplEffect);
 			throw std::runtime_error("Failed to allocate input audio buffer");
@@ -1143,6 +1195,7 @@ public:
 			iplAudioBufferInterleave(g_phonon_context, &outputBuffer, ma_offset_pcm_frames_ptr_f32(frames_out[0], totalFramesProcessed, outputBuffer.numChannels));
 			totalFramesProcessed += framesToProcessThisIteration;
 		}
+		if (muffling && lp_z1.size() == (size_t)outputBuffer.numChannels) apply_muffling(frames_out[0], totalFramesToProcess);
 		return;
 		fail:
 			ma_copy_pcm_frames(frames_out[0], frames_in[0], *frame_count_in, ma_format_f32, get_engine()->get_channels());
@@ -1674,6 +1727,14 @@ public:
 	int get_update_rate() const override {
 		std::lock_guard<std::mutex> lock(m);
 		return update_rate;
+	}
+	// Read by the audio thread every block, so it's atomic rather than behind the lock.
+	std::atomic<float> muffle_frequency{200.0f};
+	void set_muffle_frequency(float hz) override {
+		muffle_frequency.store(hz <= 0 ? 0.0f : (hz < 20.0f ? 20.0f : (hz > 20000.0f ? 20000.0f : hz)));
+	}
+	float get_muffle_frequency() const override {
+		return muffle_frequency.load();
 	}
 	sound_environment_source* create_source() override {
 		// Called from the audio thread: never wait for the worker.
