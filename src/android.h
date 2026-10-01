@@ -31,6 +31,12 @@ bool android_start_foreground_service(const std::string& title, const std::strin
 bool android_stop_foreground_service();
 std::string android_get_enabled_accessibility_services();
 bool android_is_package_installed(const std::string& package_name);
+bool android_can_vibrate();
+bool android_can_vibrate_with_strength();
+bool android_vibrate(int duration, int strength);
+bool android_vibrate_pattern(const std::vector<int>& timings, const std::vector<int>& strengths, int repeat);
+bool android_vibrate_effect(int effect);
+bool android_cancel_vibration();
 
 // JNI Helpers
 class JNIException : public std::runtime_error {

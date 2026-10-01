@@ -1,0 +1,26 @@
+/**
+	Vibrates the phone once for a given length of time.
+	bool android_vibrate(int duration, int strength = -1);
+	## Arguments:
+		* int duration: How long to vibrate for, in milliseconds.
+		* int strength = -1: How hard to vibrate from 1 (softest) to 255 (hardest), or -1 for the phone's default strength.
+	## Returns:
+		bool: true if the vibration was started, false otherwise or if called on a platform other than Android.
+	## Remarks:
+		This vibrates the phone itself. To vibrate a game controller, use the vibrate method of the joystick object instead.
+		Many phones can only switch their vibrator on and off, in which case the strength is ignored. Use android_can_vibrate_with_strength to find out.
+		The user can turn vibration off in the phone's settings, and Android may also silence it in battery saver or do not disturb mode. In those cases this function can still return true even though nothing is felt. Android also won't usually let an app vibrate while it is in the background.
+		Starting a new vibration replaces any that is still playing.
+*/
+
+// Example:
+void main() {
+	if (!android_can_vibrate()) {
+		alert("vibration", "This device can't vibrate.");
+		return;
+	}
+	android_vibrate(300); // A third of a second at the default strength.
+	wait(1000);
+	android_vibrate(300, 60); // The same again, but softer if the phone supports it.
+	wait(500);
+}

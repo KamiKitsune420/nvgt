@@ -299,6 +299,93 @@ bool android_stop_foreground_service() {
 	return result;
 }
 
+// Vibrating the phone itself, through com.samtupy.nvgt.Haptics. These all return false if the phone has no vibrator or anything goes wrong.
+static jclass HapticsClass = nullptr;
+static jmethodID android_haptics_method(JNIEnv*& env, const char* name, const char* signature) {
+	env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return nullptr;
+	if (!HapticsClass) {
+		LocalRef<jclass> cls(env, env->FindClass("com/samtupy/nvgt/Haptics"));
+		if (!cls.get()) {
+			env->ExceptionClear();
+			return nullptr;
+		}
+		HapticsClass = (jclass)env->NewGlobalRef(cls.get());
+		if (!HapticsClass) return nullptr;
+	}
+	jmethodID mid = env->GetStaticMethodID(HapticsClass, name, signature);
+	if (!mid) env->ExceptionClear();
+	return mid;
+}
+static bool android_haptics_result(JNIEnv* env, bool result) {
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+static jintArray android_haptics_int_array(JNIEnv* env, const std::vector<int>& values) {
+	jintArray result = env->NewIntArray(values.size());
+	if (!result) {
+		env->ExceptionClear();
+		return nullptr;
+	}
+	static_assert(sizeof(jint) == sizeof(int), "jint is expected to be an int");
+	if (!values.empty()) env->SetIntArrayRegion(result, 0, values.size(), (const jint*)values.data());
+	return result;
+}
+
+bool android_can_vibrate() {
+	JNIEnv* env;
+	jmethodID mid = android_haptics_method(env, "canVibrate", "(Landroid/app/Activity;)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	return android_haptics_result(env, env->CallStaticBooleanMethod(HapticsClass, mid, activity.get()));
+}
+
+bool android_can_vibrate_with_strength() {
+	JNIEnv* env;
+	jmethodID mid = android_haptics_method(env, "hasStrengthControl", "(Landroid/app/Activity;)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	return android_haptics_result(env, env->CallStaticBooleanMethod(HapticsClass, mid, activity.get()));
+}
+
+bool android_vibrate(int duration, int strength) {
+	JNIEnv* env;
+	jmethodID mid = android_haptics_method(env, "vibrate", "(Landroid/app/Activity;II)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	return android_haptics_result(env, env->CallStaticBooleanMethod(HapticsClass, mid, activity.get(), (jint)duration, (jint)strength));
+}
+
+bool android_vibrate_pattern(const std::vector<int>& timings, const std::vector<int>& strengths, int repeat) {
+	JNIEnv* env;
+	jmethodID mid = android_haptics_method(env, "vibratePattern", "(Landroid/app/Activity;[I[II)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	LocalRef<jintArray> jtimings(env, android_haptics_int_array(env, timings));
+	LocalRef<jintArray> jstrengths(env, android_haptics_int_array(env, strengths));
+	if (!jtimings.get() || !jstrengths.get()) return false;
+	return android_haptics_result(env, env->CallStaticBooleanMethod(HapticsClass, mid, activity.get(), jtimings.get(), jstrengths.get(), (jint)repeat));
+}
+
+bool android_vibrate_effect(int effect) {
+	JNIEnv* env;
+	jmethodID mid = android_haptics_method(env, "vibrateEffect", "(Landroid/app/Activity;I)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	return android_haptics_result(env, env->CallStaticBooleanMethod(HapticsClass, mid, activity.get(), (jint)effect));
+}
+
+bool android_cancel_vibration() {
+	JNIEnv* env;
+	jmethodID mid = android_haptics_method(env, "cancel", "(Landroid/app/Activity;)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	return android_haptics_result(env, env->CallStaticBooleanMethod(HapticsClass, mid, activity.get()));
+}
+
 std::vector<std::string> android_get_tts_engine_packages() {
 	try {
 		android_setup_jni();

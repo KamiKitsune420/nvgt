@@ -1,0 +1,21 @@
+/**
+	Plays one of the short, crisp vibrations that an Android phone provides itself, such as a click or a tick.
+	bool android_vibrate_effect(android_haptic_effect effect);
+	## Arguments:
+		* android_haptic_effect effect: Which effect to play, see the android_haptic_effect enum.
+	## Returns:
+		bool: true if the effect was played, false otherwise or if called on a platform other than Android.
+	## Remarks:
+		These effects are tuned by the phone's manufacturer, so they usually feel much cleaner than a short call to android_vibrate. They suit feedback that happens often, like moving through a menu.
+		Before Android 10 these effects don't exist, so a plain short vibration is played in their place.
+*/
+
+// Example:
+void main() {
+	show_window("haptics");
+	while (!key_pressed(KEY_ESCAPE) and !key_pressed(KEY_AC_BACK)) {
+		wait(5);
+		if (key_pressed(KEY_UP) or key_pressed(KEY_DOWN)) android_vibrate_effect(ANDROID_HAPTIC_TICK);
+		if (key_pressed(KEY_RETURN)) android_vibrate_effect(ANDROID_HAPTIC_CLICK);
+	}
+}

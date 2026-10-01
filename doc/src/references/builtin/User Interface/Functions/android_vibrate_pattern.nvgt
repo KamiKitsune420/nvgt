@@ -1,0 +1,28 @@
+/**
+	Vibrates the phone in a pattern of several steps, such as a series of pulses.
+	bool android_vibrate_pattern(int[]@ timings, int[]@ strengths = null, int repeat = -1);
+	## Arguments:
+		* int[]@ timings: The length of each step of the pattern, in milliseconds.
+		* int[]@ strengths = null: The strength of each step from 0 (a pause) to 255 (hardest), or -1 for the phone's default strength. If given, it must contain as many items as timings.
+		* int repeat = -1: The index of the step to go back to when the pattern ends, making it loop until android_cancel_vibration is called, or -1 to play the pattern once.
+	## Returns:
+		bool: true if the pattern was started, false otherwise or if called on a platform other than Android.
+	## Remarks:
+		If strengths is not given, the steps alternate starting with a vibration: the first step vibrates, the second is a pause, the third vibrates and so on.
+		On phones that can only switch their vibrator on and off, any strength other than 0 is simply on. If the difference between a soft and a hard pulse matters to your game, check android_can_vibrate_with_strength and tell the pulses apart by their length instead when it returns false.
+		A pattern that repeats keeps going until you call android_cancel_vibration or start another vibration.
+*/
+
+// Example:
+void main() {
+	// Three short pulses with short pauses between them.
+	android_vibrate_pattern({80, 60, 80, 60, 80});
+	wait(1500);
+	// A soft pulse, a pause, then a long hard one.
+	android_vibrate_pattern({100, 100, 400}, {60, 0, 255});
+	wait(1500);
+	// A heartbeat that loops until cancelled.
+	android_vibrate_pattern({60, 120, 60, 700}, {255, 0, 255, 0}, 0);
+	wait(5000);
+	android_cancel_vibration();
+}
