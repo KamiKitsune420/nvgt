@@ -1300,6 +1300,19 @@ public:
 	bool get_portal_route(float& x, float& y, float& z, float& distance) const override {
 		return sound_environment_source_get_route(env_source, x, y, z, distance);
 	}
+	bool get_portal_blend(float& x, float& y, float& z, float& distance, float& share) const override {
+		sound_environment_source* s = env_source;
+		if (s && sound_environment_source_ready(s)) return sound_environment_source_get_portal_blend(s, x, y, z, distance, share);
+		// Only just started, so no simulation of its own yet: what was found at this spot recently.
+		sound_environment* env = get_effective_environment();
+		float sx, sy, sz;
+		if (!env || !get_occlusion_position(sx, sy, sz)) return false;
+		return env->get_portal_blend_at(sx, sy, sz, x, y, z, distance, share);
+	}
+	float get_muffle_ratio() const override {
+		sound_environment_source* s = env_source;
+		return s ? sound_environment_source_get_muffle_ratio(s) : 1.0f;
+	}
 	float get_transmission(int band) const override {
 		sound_environment_source* s = env_source;
 		if (!s || band < 0 || band > 2) return 1.0f;
@@ -2416,6 +2429,8 @@ template<class T> void RegisterSoundsystemMixer(asIScriptEngine *engine, const s
 	engine->RegisterObjectMethod(type.c_str(), "void clear_occlusion_position()", asFUNCTION((virtual_call < T, &T::clear_occlusion_position, void>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "bool get_portal_route(float &out x, float &out y, float &out z, float &out distance) const", asFUNCTION((virtual_call < T, &T::get_portal_route, bool, float&, float&, float&, float&>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "float get_transmission(int band) const", asFUNCTION((virtual_call < T, &T::get_transmission, float, int>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "bool get_portal_blend(float &out x, float &out y, float &out z, float &out distance, float &out share) const", asFUNCTION((virtual_call < T, &T::get_portal_blend, bool, float&, float&, float&, float&, float&>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod(type.c_str(), "float get_muffle_ratio() const property", asFUNCTION((virtual_call < T, &T::get_muffle_ratio, float>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "void set_reverb3d_at(reverb3d@+ reverb, reverb3d_placement placement)", asFUNCTION((virtual_call < T, &T::set_reverb3d_at, void, reverb3d*, audio_spatializer_reverb3d_placement>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "reverb3d@+ get_reverb3d() const property", asFUNCTION((virtual_call < T, &T::get_reverb3d, reverb3d*>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod(type.c_str(), "audio_splitter_node@+ get_reverb3d_attachment() const property", asFUNCTION((virtual_call < T, &T::get_reverb3d_attachment, splitter_node*>)), asCALL_CDECL_OBJFIRST);

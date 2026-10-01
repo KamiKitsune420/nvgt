@@ -406,9 +406,12 @@ public:
 	// Muffling through walls: a low-pass filter on top of the transmission bands. Three broad bands (split at 800 Hz and 8 kHz) can only tilt a
 	// sound, but a wall stops high sound far more than low, so on their own a sound behind a wall is just quieter, not behind a wall. The
 	// cutoff goes from this frequency (when nothing high gets through) up to fully open (when as much high gets through as low). 0 turns it off.
-	// Sound coming round through a portal isn't filtered: the bend's own bands already dull it about right.
+	// Sound coming round through a portal isn't filtered again (the bend's own bands already dull it), and the two are blended by how much
+	// each carries, so a doorway coming into view lifts the muffling gradually. A sound's muffle_ratio says how open the filter is.
 	virtual void set_muffle_frequency(float hz) = 0;
 	virtual float get_muffle_frequency() const = 0;
+	// The doorway route recently found for a sound at this spot (see sound_environment_source_get_portal_blend), for a sound not simulated yet.
+	virtual bool get_portal_blend_at(float sound_x, float sound_y, float sound_z, float& x, float& y, float& z, float& distance, float& share) = 0;
 	// Used by mixers and the phonon attenuator.
 	virtual sound_environment_source* create_source() = 0; // Returns null if the environment is busy; try again next block.
 	virtual void release_source(sound_environment_source* source) = 0;
@@ -419,3 +422,8 @@ void sound_environment_source_set_positions(sound_environment_source* source, fl
 void sound_environment_source_get_results(sound_environment_source* source, float& occlusion, float transmission[3]);
 // The route through a portal, if the sound is currently heard that way: the portal's position and the total distance listener to portal to sound.
 bool sound_environment_source_get_route(sound_environment_source* source, float& x, float& y, float& z, float& distance);
+// How open the muffling filter is for this source: 1 not muffled, 0 cut right down to the muffle frequency.
+float sound_environment_source_get_muffle_ratio(sound_environment_source* source);
+bool sound_environment_source_ready(sound_environment_source* source);
+// The best route round through a portal, whether or not it has taken over, and how much of the sound it carries (0 to 1).
+bool sound_environment_source_get_portal_blend(sound_environment_source* source, float& x, float& y, float& z, float& distance, float& share);

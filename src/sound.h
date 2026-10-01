@@ -291,6 +291,10 @@ public:
 	// Put the sound in the portal's direction, that far away, and it's heard from the doorway (sound_pool does this).
 	virtual bool get_portal_route(float& x, float& y, float& z, float& distance) const = 0; // Latest simulated occlusion: 1 is clear, 0 fully blocked. 1 without an environment.
 	virtual float get_transmission(int band) const = 0; // How much of a band (0 low, 1 mid, 2 high) gets through what's in the way. 1 without an environment.
+	virtual float get_muffle_ratio() const = 0;
+	// The best route round through a portal (doorway) even before it has taken over, and how much of the sound it carries (0 to 1). Place
+	// the sound that far from its real direction towards the doorway, and it drifts round smoothly (sound_pool does this).
+	virtual bool get_portal_blend(float& x, float& y, float& z, float& distance, float& share) const = 0; // How open the muffling filter is: 1 not muffled, 0 cut right down to the environment's muffle_frequency. 1 without an environment.
 	virtual bool play(bool reset_loop_state = true) = 0;
 	virtual bool play_looped() = 0;
 	virtual bool stop() = 0;

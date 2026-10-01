@@ -178,6 +178,8 @@ audio_node_chain* audio_node_chain::create(audio_node* source, audio_node* endpo
 bool sound_environment_source_ready(sound_environment_source* s);
 bool sound_environment_try_prefill(sound_environment* env, sound_environment_source* s);
 void sound_environment_source_get_route_bands(sound_environment_source* s, float bands[3]);
+void sound_environment_source_get_results(sound_environment_source* s, float& occlusion, float transmission[3]);
+float sound_environment_source_get_muffle_ratio(sound_environment_source* s);
 
 static IPLAudioSettings g_phonon_audio_settings {44100, SOUNDSYSTEM_FRAMESIZE}; // We will update samplerate later in phonon_init.
 static IPLContext g_phonon_context = nullptr;
@@ -1102,12 +1104,8 @@ public:
 		float occlusion, transmission[3], route[3];
 		sound_environment_source_get_results(source, occlusion, transmission);
 		sound_environment_source_get_route_bands(source, route);
-		// How much high sound the walls let through compared to low. Round through a portal there's no wall muffling: the route's bands are the bend.
-		float high_to_low = 1.0f;
-		if (route[1] <= 0) {
-			float low = occlusion + (1.0f - occlusion) * transmission[0], high = occlusion + (1.0f - occlusion) * transmission[2];
-			if (low > 0.0001f) high_to_low = high / low;
-		}
+		// How much high sound gets through compared to low, blending the wall's muffling with the doorway's (see the helper).
+		float high_to_low = sound_environment_source_get_muffle_ratio(source);
 		float muffle_hz = env ? env->get_muffle_frequency() : 0.0f;
 		bool was_muffling = muffling;
 		muffling = muffle_hz > 0;
@@ -1220,6 +1218,9 @@ struct sound_environment_source {
 	std::atomic<bool> via_active {false};
 	std::atomic<float> via_amount {0}, via_x {0}, via_y {0}, via_z {0}, via_distance {0};
 	std::atomic<float> via_eq[3] = {1.0f, 1.0f, 1.0f};
+	// The best route round through a portal, per band, whether or not it's carrying more than the wall (0 without one). The attenuator
+	// blends it in, so a doorway coming into view fades in over a few steps instead of switching on at once.
+	std::atomic<float> route_mix[3] = {0.0f, 0.0f, 0.0f};
 };
 
 void sound_environment_source_set_positions(sound_environment_source* s, float sound_x, float sound_y, float sound_z, float listener_x, float listener_y, float listener_z) {
@@ -1241,15 +1242,49 @@ bool sound_environment_source_get_route(sound_environment_source* s, float& x, f
 	distance = s->via_distance.load();
 	return true;
 }
-// For the attenuator: how much of each band the portal route carries (0 when there's no route).
+// For the attenuator: how much of each band the best portal route carries (0 when there's none). Blended in even before the route is
+// strong enough to be heard from the doorway's direction, so nothing jumps when it takes over.
 void sound_environment_source_get_route_bands(sound_environment_source* s, float bands[3]) {
-	bool active = s && s->via_active.load(std::memory_order_acquire);
-	float amount = active ? s->via_amount.load() : 0.0f;
-	for (int i = 0; i < 3; i++) bands[i] = active ? amount * s->via_eq[i].load() : 0.0f;
+	for (int i = 0; i < 3; i++) bands[i] = s ? s->route_mix[i].load(std::memory_order_relaxed) : 0.0f;
 }
 void sound_environment_source_get_results(sound_environment_source* s, float& occlusion, float transmission[3]) {
 	occlusion = s->occlusion.load(std::memory_order_relaxed);
 	for (int i = 0; i < 3; i++) transmission[i] = s->transmission[i].load(std::memory_order_relaxed);
+}
+// How much high sound gets through compared to low (1 not muffled, 0 muffled right down to the muffle frequency). Through the wall it's the
+// wall's own high-to-low; round through a doorway the bend's bands already dull the sound, so that part isn't muffled again. The two are
+// blended by how much of the mid band each carries: a doorway you can hardly see barely lifts the muffling, and one you're lined up with
+// almost clears it. It used to switch straight to clear once the doorway won, so walking past one flipped the muffling off and on.
+// How much of what's heard comes round through the doorway rather than through the wall, by the mid band: 0 to 1.
+static float route_share(float occlusion, float transmission_mid, float route_mid) {
+	if (route_mid <= 0) return 0.0f;
+	float direct_mid = occlusion + (1.0f - occlusion) * transmission_mid;
+	return route_mid / (route_mid + direct_mid);
+}
+float sound_environment_source_get_muffle_ratio(sound_environment_source* s) {
+	if (!s) return 1.0f;
+	float occlusion, transmission[3], route[3];
+	sound_environment_source_get_results(s, occlusion, transmission);
+	sound_environment_source_get_route_bands(s, route);
+	float low = occlusion + (1.0f - occlusion) * transmission[0], high = occlusion + (1.0f - occlusion) * transmission[2];
+	float wall = low > 0.0001f ? high / low : 1.0f;
+	wall = wall < 0 ? 0 : (wall > 1 ? 1 : wall);
+	return wall + (1.0f - wall) * route_share(occlusion, transmission[1], route[1]);
+}
+// The best route round through a doorway and how much of the sound it carries (see route_share), whether or not it has taken over.
+// sound_pool places the sound that far between where it really is and the doorway, so its direction drifts rather than jumping.
+bool sound_environment_source_get_portal_blend(sound_environment_source* s, float& x, float& y, float& z, float& distance, float& share) {
+	if (!s || !s->has_results.load(std::memory_order_acquire)) return false;
+	float route_mid = s->route_mix[1].load(std::memory_order_acquire);
+	if (route_mid <= 0) return false;
+	float occlusion, transmission[3];
+	sound_environment_source_get_results(s, occlusion, transmission);
+	x = s->via_x.load();
+	y = s->via_y.load();
+	z = s->via_z.load();
+	distance = s->via_distance.load();
+	share = route_share(occlusion, transmission[1], route_mid);
+	return true;
 }
 
 class sound_environment_impl : public sound_environment {
@@ -1441,7 +1476,8 @@ class sound_environment_impl : public sound_environment {
 				// 2: from each portal the listener can see, for the sounds the straight line doesn't reach well.
 				if (any_blocked) {
 					for (portal& p : portals) {
-						if (!p.added || p.visibility < 0.25f) continue;
+						// Even a doorway you can barely see is tried, so its sound fades in as it comes into view (its share is tiny at first).
+						if (!p.added || p.visibility < 0.02f) continue;
 						run_from(p.x, p.y, p.z);
 						for (size_t i = 0; i < sources.size(); i++) {
 							sound_environment_source* src = sources[i].get();
@@ -1449,7 +1485,7 @@ class sound_environment_impl : public sound_environment {
 							if (!src->added || !src->has_position.load(std::memory_order_acquire) || r.occlusion >= 0.9f) continue;
 							float seen = read_occlusion(src->source);
 							float amount = p.visibility * seen;
-							if (amount < 0.05f) continue;
+							if (amount < 0.01f) continue;
 							float sx = src->sx.load(), sy = src->sy.load(), sz = src->sz.load();
 							// The bend at the portal: between listener-to-portal and portal-to-sound.
 							float ax = p.x - listener.x, ay = p.y - listener.y, az = p.z - listener.z;
@@ -1488,7 +1524,7 @@ class sound_environment_impl : public sound_environment {
 					r.via_active = r.via_amount > 0 && via_mid > direct_mid * (was_active ? 0.8f : 1.25f);
 					src->occlusion.store(r.occlusion, std::memory_order_relaxed);
 					for (int b = 0; b < 3; b++) src->transmission[b].store(r.transmission[b], std::memory_order_relaxed);
-					if (r.via_active) {
+					if (r.via_amount > 0) {
 						src->via_amount.store(r.via_amount);
 						for (int b = 0; b < 3; b++) src->via_eq[b].store(r.via_eq[b]);
 						src->via_x.store(r.via_x);
@@ -1496,6 +1532,7 @@ class sound_environment_impl : public sound_environment {
 						src->via_z.store(r.via_z);
 						src->via_distance.store(r.via_distance);
 					}
+					for (int b = 0; b < 3; b++) src->route_mix[b].store(r.via_amount * r.via_eq[b], std::memory_order_release);
 					src->via_active.store(r.via_active, std::memory_order_release);
 					src->has_results.store(true, std::memory_order_release);
 					if (cache.size() > 4096) cache.clear();
@@ -1752,6 +1789,23 @@ public:
 	void release_source(sound_environment_source* s) override {
 		if (s) s->active.store(false);
 	}
+	// For a sound that's only just started (no simulation of its own yet): the doorway route found at the same spot recently, as
+	// sound_environment_source_get_portal_blend() gives it. Never waits for the worker; false if it's busy or there's nothing.
+	bool get_portal_blend_at(float sx, float sy, float sz, float& x, float& y, float& z, float& distance, float& share) override {
+		float lx, ly, lz;
+		if (!get_listener(lx, ly, lz)) return false;
+		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
+		if (!lock.owns_lock()) return false;
+		auto it = cache.find(cache_key(sx, sy, sz, lx, ly, lz));
+		if (it == cache.end() || it->second.via_amount <= 0) return false;
+		const cached_result& r = it->second;
+		x = r.via_x;
+		y = r.via_y;
+		z = r.via_z;
+		distance = r.via_distance;
+		share = route_share(r.occlusion, r.transmission[1], r.via_amount * r.via_eq[1]);
+		return true;
+	}
 	// Gives a new source the result simulated at the same spot recently, if there is one. Audio thread: never waits.
 	bool try_prefill(sound_environment_source* s) {
 		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
@@ -1761,7 +1815,7 @@ public:
 		const cached_result& r = it->second;
 		s->occlusion.store(r.occlusion);
 		for (int i = 0; i < 3; i++) s->transmission[i].store(r.transmission[i]);
-		if (r.via_active) {
+		if (r.via_amount > 0) {
 			s->via_amount.store(r.via_amount);
 			for (int i = 0; i < 3; i++) s->via_eq[i].store(r.via_eq[i]);
 			s->via_x.store(r.via_x);
@@ -1769,6 +1823,7 @@ public:
 			s->via_z.store(r.via_z);
 			s->via_distance.store(r.via_distance);
 		}
+		for (int i = 0; i < 3; i++) s->route_mix[i].store(r.via_amount * r.via_eq[i], std::memory_order_release);
 		s->via_active.store(r.via_active, std::memory_order_release);
 		s->has_results.store(true, std::memory_order_release);
 		return true;
