@@ -413,8 +413,11 @@ public:
 	// The doorway route recently found for a sound at this spot (see sound_environment_source_get_portal_blend), for a sound not simulated yet.
 	virtual bool get_portal_blend_at(float sound_x, float sound_y, float sound_z, float& x, float& y, float& z, float& distance, float& share) = 0;
 	// Used by mixers and the phonon attenuator.
-	virtual sound_environment_source* create_source() = 0; // Returns null if the environment is busy; try again next block.
+	virtual sound_environment_source* create_source(bool wait = false) = 0; // Without wait (the audio thread), returns null if the environment is busy; try again next block.
 	virtual void release_source(sound_environment_source* source) = 0;
+	// Gives a sound that is about to start its result before it plays, so its first block is neither silent nor judged from somewhere it
+	// isn't: the result found at the same spot recently, or else a simulation, waited for briefly. Not for the audio thread.
+	virtual void prime_source(sound_environment_source* source, float sound_x, float sound_y, float sound_z, float listener_x, float listener_y, float listener_z) = 0;
 	static sound_environment* create();
 };
 // Per-sound simulation results, for the phonon attenuator. All thread safe.

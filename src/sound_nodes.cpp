@@ -1321,6 +1321,7 @@ class sound_environment_impl : public sound_environment {
 	std::unordered_map<uint64_t, cached_result> cache;
 	mutable std::mutex m;
 	std::condition_variable wake;
+	std::condition_variable published; // A pass has given its results to the sources (see prime_source).
 	std::thread worker;
 	bool running = true;
 	bool scene_dirty = false;
@@ -1452,6 +1453,9 @@ class sound_environment_impl : public sound_environment {
 				}
 				set_source_inputs(src->source, src->sx.load(), src->sy.load(), src->sz.load(), occlusion_radius);
 			}
+			// The script's own listener is where the listener is now. A source only knows where it was the last time its sound was
+			// processed, which for a paused or finished sound may be long ago and somewhere else.
+			if (have_listener && has_listener.load()) listener = IPLVector3 {listener_x.load(), listener_y.load(), listener_z.load()};
 			for (portal& p : portals)
 				if (p.added) set_source_inputs(p.source, p.x, p.y, p.z, p.radius);
 			if (have_listener) {
@@ -1538,6 +1542,7 @@ class sound_environment_impl : public sound_environment {
 					if (cache.size() > 4096) cache.clear();
 					cache[cache_key(src->sx.load(), src->sy.load(), src->sz.load(), src->lx.load(), src->ly.load(), src->lz.load())] = r;
 				}
+				published.notify_all();
 			}
 			wake_requested = false;
 			int rate = update_rate < 1 ? 1 : update_rate;
@@ -1773,10 +1778,11 @@ public:
 	float get_muffle_frequency() const override {
 		return muffle_frequency.load();
 	}
-	sound_environment_source* create_source() override {
-		// Called from the audio thread: never wait for the worker.
-		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
-		if (!lock.owns_lock()) return nullptr;
+	sound_environment_source* create_source(bool wait) override {
+		// From the audio thread: never wait for the worker.
+		std::unique_lock<std::mutex> lock(m, std::defer_lock);
+		if (wait) lock.lock();
+		else if (!lock.try_lock()) return nullptr;
 		auto s = std::make_unique<sound_environment_source>();
 		IPLSourceSettings settings {IPL_SIMULATIONFLAGS_DIRECT};
 		if (iplSourceCreate(sim, &settings, &s->source) != IPL_STATUS_SUCCESS) return nullptr;
@@ -1806,10 +1812,27 @@ public:
 		share = route_share(r.occlusion, r.transmission[1], r.via_amount * r.via_eq[1]);
 		return true;
 	}
+	void prime_source(sound_environment_source* s, float sx, float sy, float sz, float lx, float ly, float lz) override {
+		if (!s) return;
+		std::unique_lock<std::mutex> lock(m);
+		// Already simulated where it is, as a sound played again without moving is: nothing to do, and no gap in what is playing.
+		if (s->has_results.load() && s->sx.load() == sx && s->sy.load() == sy && s->sz.load() == sz && s->lx.load() == lx && s->ly.load() == ly && s->lz.load() == lz) return;
+		sound_environment_source_set_positions(s, sx, sy, sz, lx, ly, lz);
+		// Whatever it has was found for somewhere else: while a file loads, a sound may already have been simulated at the origin.
+		s->has_results.store(false, std::memory_order_release);
+		if (fill_from_cache(s)) return;
+		wake_requested = true;
+		wake.notify_all();
+		published.wait_for(lock, std::chrono::milliseconds(20), [s] { return s->has_results.load(std::memory_order_acquire); });
+	}
 	// Gives a new source the result simulated at the same spot recently, if there is one. Audio thread: never waits.
 	bool try_prefill(sound_environment_source* s) {
 		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
 		if (!lock.owns_lock()) return false;
+		return fill_from_cache(s);
+	}
+	// With the lock held.
+	bool fill_from_cache(sound_environment_source* s) {
 		auto it = cache.find(cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load()));
 		if (it == cache.end()) return false;
 		const cached_result& r = it->second;

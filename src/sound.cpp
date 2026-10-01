@@ -1327,20 +1327,37 @@ public:
 	sound_environment_source* get_environment_source() override {
 		// Called from the audio thread, so never wait: if the script is changing the environment right now, keep the current source for this block.
 		if (!environment_mutex.try_lock()) return env_source;
+		sound_environment_source* result = environment_source_locked(false);
+		environment_mutex.unlock();
+		return result;
+	}
+	// This sound's source in the environment it is in now, made if it has none. With environment_mutex held.
+	sound_environment_source* environment_source_locked(bool wait) {
 		sound_environment* env = get_effective_environment();
 		if (env != env_source_owner) {
 			if (env_source) env_source_owner->release_source(env_source);
 			env_source = nullptr;
 			if (env_source_owner) env_source_owner->release();
 			env_source_owner = nullptr;
-			if (env && (env_source = env->create_source())) {
+			if (env && (env_source = env->create_source(wait))) {
 				env->add_ref();
 				env_source_owner = env;
 			}
 		}
-		sound_environment_source* result = env_source;
-		environment_mutex.unlock();
-		return result;
+		return env_source;
+	}
+	// About to start playing: the environment works out what is between this sound and the listener now, from the script's thread, so the
+	// first block the audio thread plays already has its result. Otherwise that block is silent, which takes the start off a short sound.
+	void prime_environment() {
+		audio_spatialization_parameters params;
+		if (!get_spatialization_parameters(params)) return;
+		lock_guard<mutex> lock(environment_mutex);
+		sound_environment_source* source = environment_source_locked(true);
+		if (!source) return;
+		float sx = params.sound_x, sy = params.sound_y, sz = params.sound_z, lx = params.listener_x, ly = params.listener_y, lz = params.listener_z;
+		get_occlusion_position(sx, sy, sz);
+		env_source_owner->get_listener(lx, ly, lz);
+		env_source_owner->prime_source(source, sx, sy, sz, lx, ly, lz);
 	}
 	bool get_spatialization_parameters(audio_spatialization_parameters& params) override {
 		if (!snd || !get_spatialization_enabled() || !spatialization_params_mutex.try_lock()) return false;
@@ -1627,7 +1644,13 @@ class sound_impl final : public mixer_impl, public virtual sound {
 	typedef struct {
 		ma_async_notification_callbacks cb;
 		std::atomic_flag *pAtomicFlag;
+		sound_impl* owner;
 	} async_notification_callbacks;
+	// MiniAudio will start a sound that is still being decoded, and plays what it hasn't reached yet as silence while moving on through it, so
+	// a sound played straight after load() lost its first few milliseconds. A sound asked to play before its load has finished starts the
+	// moment it does instead. start_mutex makes "is it loaded? then start, else leave word" one step against the job thread finishing.
+	std::mutex start_mutex;
+	std::atomic<bool> start_pending {false};
 	std::string pcm_buffer;      // When loading from raw PCM (like TTS) we store the intermediate wav data here so we can take advantage of async loading to return quickly. Makes a substantial difference in the responsiveness of TTS calls.
 	std::string loaded_filename; // Contains the loaded filename as passed in the load/stream method, used just for convenience.
 	ma_fence fence;
@@ -1651,7 +1674,34 @@ class sound_impl final : public mixer_impl, public virtual sound {
 public:
 	static void async_notification_callback(ma_async_notification *pNotification) {
 		async_notification_callbacks *anc = (async_notification_callbacks *)pNotification;
+		sound_impl* owner = anc->owner;
+		lock_guard<mutex> lock(owner->start_mutex);
 		anc->pAtomicFlag->test_and_set();
+		if (owner->start_pending && owner->snd) ma_sound_start(&*owner->snd);
+		owner->start_pending = false;
+	}
+	// play() and play_looped(): now if the sound is loaded, and as soon as it is if not.
+	bool start_when_loaded(bool looped, bool reset_loop_state) {
+		if (!snd) return false;
+		prime_environment();
+		{
+			lock_guard<mutex> lock(start_mutex);
+			if (!load_completed.test()) {
+				if (looped || reset_loop_state) ma_sound_set_looping(&*snd, looped ? MA_TRUE : MA_FALSE);
+				start_pending = true;
+				return true;
+			}
+		}
+		return looped ? mixer_impl::play_looped() : mixer_impl::play(reset_loop_state);
+	}
+	// Whatever was waiting for the load to finish no longer is.
+	void forget_pending_start() {
+		lock_guard<mutex> lock(start_mutex);
+		start_pending = false;
+	}
+	// A sound waiting for its load to start is as good as playing: a sound_pool frees a slot whose sound is not.
+	bool get_playing() const override {
+		return start_pending || mixer_impl::get_playing();
 	}
 	sound_impl(audio_engine *e) : paused(false), should_autoclose(false), datasource(nullptr), pcm_stream(nullptr), mixer_impl(dynamic_cast <audio_engine_impl*> (e), false), pcm_buffer() {
 		init_sound();
@@ -1659,6 +1709,7 @@ public:
 		ma_fence_init(&fence);
 		notification_callbacks.cb.onSignal = &async_notification_callback;
 		notification_callbacks.pAtomicFlag = &load_completed;
+		notification_callbacks.owner = this;
 	}
 	~sound_impl() {
 		close();
@@ -1837,6 +1888,7 @@ public:
 		if (!snd) return false;
 		// It's possible that this sound could still be loading in a job thread when we try to destroy it. Unfortunately there isn't a way to cancel this, so we have to just wait.
 		if (!load_completed.test()) ma_fence_wait(&fence);
+		forget_pending_start(); // Also waits out a job thread still in the notification.
 		if (spatializer) {
 			unique_lock<mutex> lock(spatialization_params_mutex);
 			node_chain->remove_node(spatializer);
@@ -1874,12 +1926,12 @@ public:
 	bool play(bool reset_loop_state = true) override {
 		paused = false;
 		if (pcm_stream) ma_pcm_rb_reset(&*pcm_stream);
-		return mixer_impl::play(reset_loop_state);
+		return start_when_loaded(false, reset_loop_state);
 	}
 	bool play_looped() override {
 		if (pcm_stream) return false;
 		paused = false;
-		return mixer_impl::play_looped();
+		return start_when_loaded(true, true);
 	}
 	bool play_wait() override {
 		if (pcm_stream || !play())
@@ -1890,9 +1942,11 @@ public:
 	}
 	bool stop() override {
 		paused = false;
+		forget_pending_start();
 		return mixer_impl::stop() && seek(0);
 	}
 	bool pause() override {
+		forget_pending_start();
 		if (snd && !pcm_stream) {
 			g_soundsystem_last_error = ma_sound_stop(&*snd);
 			if (g_soundsystem_last_error == MA_SUCCESS)
