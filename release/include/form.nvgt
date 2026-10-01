@@ -118,6 +118,177 @@ funcdef bool kb_echo_update_callback(audio_form@ f, int echo);
 bool audioform_input_disable_ralt = true;
 int audioform_keyboard_echo = textflag_characters;
 form_background_callback@ audioform_default_background_callback = null;
+
+/* Touch screens and on-screen keyboards.
+	On a touch screen, any form that is being monitored can be operated with these gestures:
+		swipe right or left: next or previous control
+		swipe up or down: up or down arrow (previous or next list item, slider value or line of text)
+		double tap: activate the focused control (press a button, toggle a checkbox, bring up the keyboard in an input box)
+		swipe left or right with 2 fingers: left or right arrow (move through text by character)
+		swipe up or down with 2 fingers: home or end
+		tap with 2 fingers: stop speech
+	A gesture is turned into the key presses that do the same thing, so anything a form can do with a keyboard also works by touch.
+	On a device with an on-screen keyboard, the keyboard comes up when an editable input box gains focus and goes away when focus leaves it.
+*/
+bool audioform_touch_navigation = true; // Set to false if your game handles touch gestures in forms itself.
+bool audioform_screen_keyboard = true; // Set to false to manage the on-screen keyboard yourself with start_text_input and stop_text_input.
+float audioform_touch_swipe_distance = 0.1; // How far a finger must travel to count as a swipe, where 1.0 is the full width or height of the screen.
+uint audioform_touch_tap_time = 500; // The longest a finger can stay down for a tap and the longest gap between the 2 taps of a double tap, in milliseconds.
+enum audioform_touch_gesture {
+	audioform_gesture_swipe_left = 0,
+	audioform_gesture_swipe_right,
+	audioform_gesture_swipe_up,
+	audioform_gesture_swipe_down,
+	audioform_gesture_swipe_left_2,
+	audioform_gesture_swipe_right_2,
+	audioform_gesture_swipe_up_2,
+	audioform_gesture_swipe_down_2,
+	audioform_gesture_double_tap,
+	audioform_gesture_tap_2
+}
+// This is an internal class and should not be used by the application.
+class audioform_touch_state {
+	uint64[] finger_ids;
+	float[] finger_x, finger_y; // Where each finger first touched the screen.
+	uint max_fingers = 0; // The most fingers that have been down at once since the screen was last empty.
+	bool swiped = false;
+	uint64 first_down = 0, last_tap = 0;
+	int[] gestures; // Recognised and waiting for a form to act on them.
+	int[] keys; // Held down on behalf of the last gesture.
+	uint64 keys_time = 0;
+	uint64 last_monitor = 0;
+	bool hooked = false;
+	// Gestures only count while a form is being monitored, so that they don't press keys behind the back of the rest of a game.
+	bool get_listening() property {
+		return audioform_touch_navigation and ticks() - last_monitor < 250;
+	}
+	void finger_down(uint64 id, float x, float y) {
+		if (!listening) {
+			finger_ids.resize(0);
+			finger_x.resize(0);
+			finger_y.resize(0);
+			gestures.resize(0);
+			return;
+		}
+		if (finger_ids.find(id) > -1) return;
+		if (finger_ids.length() < 1) {
+			max_fingers = 0;
+			swiped = false;
+			first_down = ticks();
+		}
+		finger_ids.insert_last(id);
+		finger_x.insert_last(x);
+		finger_y.insert_last(y);
+		if (finger_ids.length() > max_fingers) max_fingers = finger_ids.length();
+	}
+	void finger_move(uint64 id, float x, float y) {
+		int idx = finger_ids.find(id);
+		if (idx < 0 or swiped) return;
+		float dx = x - finger_x[idx], dy = y - finger_y[idx];
+		if (dx * dx + dy * dy < audioform_touch_swipe_distance * audioform_touch_swipe_distance) return;
+		swiped = true;
+		last_tap = 0;
+		int gesture;
+		if (abs(dx) > abs(dy)) gesture = dx > 0 ? audioform_gesture_swipe_right : audioform_gesture_swipe_left;
+		else gesture = dy > 0 ? audioform_gesture_swipe_down : audioform_gesture_swipe_up;
+		if (max_fingers == 2) gesture += audioform_gesture_swipe_left_2;
+		if (max_fingers <= 2) add_gesture(gesture);
+	}
+	void finger_up(uint64 id, bool canceled = false) {
+		int idx = finger_ids.find(id);
+		if (idx < 0) return;
+		finger_ids.remove_at(idx);
+		finger_x.remove_at(idx);
+		finger_y.remove_at(idx);
+		if (finger_ids.length() > 0 or swiped or canceled) return;
+		uint64 now = ticks();
+		if (now - first_down > audioform_touch_tap_time) {
+			last_tap = 0;
+			return;
+		}
+		if (max_fingers == 2) add_gesture(audioform_gesture_tap_2);
+		if (max_fingers != 1) last_tap = 0;
+		else if (last_tap > 0 and now - last_tap <= audioform_touch_tap_time) {
+			add_gesture(audioform_gesture_double_tap);
+			last_tap = 0;
+		} else last_tap = now;
+	}
+	void add_gesture(int gesture) {
+		if (listening and gestures.length() < 8) gestures.insert_last(gesture);
+	}
+	// Called by a form each time it is monitored.
+	void monitor(audio_form@ f) {
+		last_monitor = ticks();
+		if (!audioform_touch_navigation) return;
+		if (!hooked) {
+			on_touch_finger_down += audioform_touch_finger_down;
+			on_touch_finger_up += audioform_touch_finger_up;
+			on_touch_finger_move += audioform_touch_finger_move;
+			on_touch_finger_cancel += audioform_touch_finger_cancel;
+			hooked = true;
+		}
+		if (keys.length() > 0) {
+			// The keys of the last gesture stay down long enough for the form to have seen them, then they are let go.
+			if (last_monitor - keys_time < 30) return;
+			for (int i = keys.length() - 1; i >= 0; i--) simulate_key_up(keys[i]);
+			keys.resize(0);
+			return;
+		}
+		if (gestures.length() < 1) return;
+		int gesture = gestures[0];
+		gestures.remove_at(0);
+		keys = f.get_touch_gesture_keys(gesture);
+		for (uint i = 0; i < keys.length(); i++) simulate_key_down(keys[i]);
+		keys_time = last_monitor;
+	}
+}
+audioform_touch_state audioform_touch;
+// Only touch screens count. A laptop's trackpad also reports fingers, and swiping on that shouldn't move around a form.
+bool audioform_touch_finger_down(uint64 device, const touch_finger&inout finger) {
+	if (get_touch_device_type(device) == TOUCH_DEVICE_DIRECT) audioform_touch.finger_down(finger.id, finger.x, finger.y);
+	return true;
+}
+bool audioform_touch_finger_up(uint64 device, const touch_finger&inout finger) {
+	audioform_touch.finger_up(finger.id);
+	return true;
+}
+bool audioform_touch_finger_move(uint64 device, const touch_finger&inout finger, float dx, float dy) {
+	audioform_touch.finger_move(finger.id, finger.x, finger.y);
+	return true;
+}
+bool audioform_touch_finger_cancel(uint64 device, const touch_finger&inout finger) {
+	audioform_touch.finger_up(finger.id, true);
+	return true;
+}
+// The on-screen keyboard belongs to one input box at a time, which these identify. A serial of 0 means that no form has brought the keyboard up.
+uint audioform_serial_counter = 0;
+uint audioform_keyboard_form = 0;
+int audioform_keyboard_control = -1;
+void audioform_show_screen_keyboard() {
+	if (text_input_active()) stop_text_input(); // Starting afresh also makes the keyboard forget the text of whichever field it was last used in.
+	start_text_input();
+}
+void audioform_hide_screen_keyboard() {
+	if (audioform_keyboard_form == 0) return;
+	audioform_keyboard_form = 0;
+	audioform_keyboard_control = -1;
+	if (text_input_active()) stop_text_input();
+}
+// Called by a form each time it is monitored, shows or hides the on-screen keyboard as focus moves in and out of editable input boxes.
+void audioform_update_screen_keyboard(audio_form@ f) {
+	if (!SCREEN_KEYBOARD_SUPPORTED or !audioform_screen_keyboard) return;
+	uint serial;
+	int control_index;
+	if (!f.get_screen_keyboard_target(serial, control_index)) {
+		audioform_hide_screen_keyboard();
+		return;
+	}
+	if (serial == audioform_keyboard_form and control_index == audioform_keyboard_control) return; // If the user has put the keyboard away themselves, it stays away until they double tap the field or move to another.
+	audioform_keyboard_form = serial;
+	audioform_keyboard_control = control_index;
+	audioform_show_screen_keyboard();
+}
+
 //main window class
 class audio_form {
 	bool active;
@@ -131,6 +302,9 @@ class audio_form {
 	//constructor
 	audio_form() {
 		reset();
+	}
+	~audio_form() {
+		if (audioform_keyboard_form == form_serial) audioform_hide_screen_keyboard();
 	}
 	void create_window() {
 		create_window("", false, false, true);
@@ -648,6 +822,10 @@ class audio_form {
 			utility_form.monitor();
 			return 0;
 		}
+		if (!subform) {
+			audioform_touch.monitor(this);
+			audioform_update_screen_keyboard(this);
+		}
 		int start = control_focus;
 		int defaults = get_default_button();
 		int cancels = get_cancel_button();
@@ -763,6 +941,47 @@ class audio_form {
 	}
 	bool focus_silently(int control_id) {
 		return focus(control_id, false, true);
+	}
+	// The keys that do the job of a touch gesture, which depends on the control that has focus. Used internally by the form's touch support.
+	int[]@ get_touch_gesture_keys(int gesture) {
+		int focused = get_current_focus();
+		if (focused > -1 and c_form[focused].type == ct_form and @c_form[focused].subform != null) return c_form[focused].subform.get_touch_gesture_keys(gesture);
+		int type = focused > -1 ? c_form[focused].type : -1;
+		bool tab_panel = type == ct_list and c_form[focused].list_is_tab_panel;
+		switch (gesture) {
+			case audioform_gesture_swipe_right: return {KEY_TAB};
+			case audioform_gesture_swipe_left: return {KEY_LSHIFT, KEY_TAB};
+			case audioform_gesture_swipe_up: return {tab_panel ? KEY_LEFT : KEY_UP};
+			case audioform_gesture_swipe_down: return {tab_panel ? KEY_RIGHT : KEY_DOWN};
+			case audioform_gesture_swipe_left_2: return {KEY_LEFT};
+			case audioform_gesture_swipe_right_2: return {KEY_RIGHT};
+			case audioform_gesture_swipe_up_2: return {KEY_HOME};
+			case audioform_gesture_swipe_down_2: return {KEY_END};
+			case audioform_gesture_tap_2: return {KEY_LCTRL};
+			case audioform_gesture_double_tap: {
+				if (type == ct_button or type == ct_checkbox or type == ct_link or type == ct_list and c_form[focused].list_multiselect) return {KEY_SPACE};
+				if (type == ct_input and !c_form[focused].read_only and SCREEN_KEYBOARD_SUPPORTED and audioform_screen_keyboard) {
+					audioform_keyboard_form = form_serial;
+					audioform_keyboard_control = focused;
+					audioform_show_screen_keyboard();
+					return {};
+				}
+				return {KEY_RETURN};
+			}
+		}
+		return {};
+	}
+	// Finds the editable input box that has focus, if any, looking inside subforms. Used internally to decide whether the on-screen keyboard should be up.
+	bool get_screen_keyboard_target(uint&out serial, int&out control_index) {
+		serial = 0;
+		control_index = -1;
+		int focused = get_current_focus();
+		if (focused < 0) return false;
+		if (c_form[focused].type == ct_form and @c_form[focused].subform != null) return c_form[focused].subform.get_screen_keyboard_target(serial, control_index);
+		if (c_form[focused].type != ct_input or c_form[focused].read_only or !c_form[focused].enabled or !c_form[focused].visible) return false;
+		serial = form_serial;
+		control_index = focused;
+		return true;
 	}
 	bool is_disallowed_char(int control_index, string char, bool search_all = true) {
 		form_error = 0;
@@ -2300,6 +2519,7 @@ class audio_form {
 	void reset(bool reset_to_default_keyboard_echo = true) {
 		form_error = 0;
 		if (reset_to_default_keyboard_echo) default_echo_flag = audioform_keyboard_echo;
+		if (audioform_keyboard_form == form_serial) audioform_hide_screen_keyboard();
 		active = false;
 		control_focus = -1;
 		control_counter = -1;
@@ -2575,6 +2795,7 @@ class audio_form {
 	*/
 	//internal properties
 	bool subform = false;
+	private uint form_serial = ++audioform_serial_counter;
 	private int speech_output;
 	int default_echo_flag = audioform_keyboard_echo;
 	private control[] c_form;
@@ -2785,6 +3006,8 @@ class control {
 	void check(audio_form@ f, int tab_index) {
 		string char;
 		char = get_characters();
+		// An on-screen keyboard sends its enter key as text as well as a key press, the key press is what counts here.
+		if (type == ct_input and (char.find("\n") > -1 or char.find("\r") > -1)) char = char.replace("\r", "", true).replace("\n", "", true);
 		if ((type == ct_input) && key_up(KEY_LALT) && (focused)) {
 			if (!read_only) {
 				if (char != "") {
