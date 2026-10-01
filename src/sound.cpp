@@ -2092,6 +2092,24 @@ public:
 	}
 	bool set_device(int device) override {
 		if (device == device_index) return true;
+		return open_device(device);
+	}
+	bool set_voice_processing(bool enabled) override {
+		if (enabled == voice_processing) return true;
+		#ifdef __ANDROID__
+		int device = device_index;
+		voice_processing = enabled;
+		if (open_device(device)) return true;
+		// The device wouldn't open that way, so put things back as they were.
+		voice_processing = !enabled;
+		open_device(device);
+		#endif
+		return false;
+	}
+	bool get_voice_processing() const override { return voice_processing; }
+private:
+	bool voice_processing = false;
+	bool open_device(int device) {
 		if (device < -1 || device >= int(g_sound_input_devices.size())) return false;
 		if (capture_device) {
 			ma_device_stop(&*capture_device);
@@ -2104,6 +2122,11 @@ public:
 		device_config.dataCallback = capture_data_callback;
 		device_config.pUserData = this;
 		device_config.capture.pDeviceID = (device >= 0 && device < int(g_sound_input_devices.size())) ? &g_sound_input_devices[device].id : nullptr;
+		if (voice_processing) {
+			// Asks Android to treat the recording as one side of a call, which is what switches on its echo cancellation and noise suppression.
+			device_config.aaudio.inputPreset = ma_aaudio_input_preset_voice_communication;
+			device_config.opensl.recordingPreset = ma_opensl_recording_preset_voice_communication;
+		}
 		capture_device = make_unique<ma_device>();
 		if ((g_soundsystem_last_error = ma_device_init(nullptr, &device_config, &*capture_device)) != MA_SUCCESS) {
 			capture_device.reset();
@@ -2119,6 +2142,7 @@ public:
 		}
 		return true;
 	}
+public:
 	int get_device() const override { return device_index; }
 	bool set_state(ma_node_state state) override {
 		bool ret = audio_node_impl::set_state(state);
@@ -2134,7 +2158,16 @@ public:
 	void set_volume(float volume) override { if (capture_device) g_soundsystem_last_error = ma_device_set_master_volume_db(&*capture_device, volume); }
 	float get_volume() const override { float result; return capture_device && (g_soundsystem_last_error = ma_device_get_master_volume_db(&*capture_device, &result)) == MA_SUCCESS? result : 0; }
 };
-microphone* microphone::create(int device, audio_engine* engine) { return new microphone_impl(engine, device); }
+#ifdef __ANDROID__
+bool request_android_permission(const std::string& permission, asIScriptFunction* callback, const std::string& callback_data); // xplatform.cpp
+#endif
+microphone* microphone::create(int device, audio_engine* engine) {
+	#ifdef __ANDROID__
+	// Android only lets an app record once the user has agreed to it. This asks them the first time, and returns straight away once they have answered before.
+	if (!request_android_permission("android.permission.RECORD_AUDIO", nullptr, "")) throw std::runtime_error("the permission to record audio was not granted");
+	#endif
+	return new microphone_impl(engine, device);
+}
 
 audio_engine *new_audio_engine(int flags, int sample_rate, int channels) { return new audio_engine_impl(flags, sample_rate, channels); }
 mixer *new_mixer(audio_engine *engine) { return new mixer_impl(engine); }
@@ -2398,6 +2431,8 @@ void RegisterSoundsystemDataSources(asIScriptEngine* engine) {
 	engine->RegisterObjectMethod("microphone", "int get_device() const property", asFUNCTION((virtual_call < microphone, &microphone::get_device, int>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("microphone", "void set_volume(float volume)", asFUNCTION((virtual_call < microphone, &microphone::set_volume, void, float>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("microphone", "float get_volume() const property", asFUNCTION((virtual_call < microphone, &microphone::get_volume, float>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("microphone", "bool set_voice_processing(bool enabled)", asFUNCTION((virtual_call < microphone, &microphone::set_voice_processing, bool, bool>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("microphone", "bool get_voice_processing() const property", asFUNCTION((virtual_call < microphone, &microphone::get_voice_processing, bool>)), asCALL_CDECL_OBJFIRST);
 }
 template <class T> void RegisterSoundsystemEncoder(asIScriptEngine* engine, const std::string& type) {
 	RegisterSoundsystemAudioNode<T>(engine, type);

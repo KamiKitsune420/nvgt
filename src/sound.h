@@ -435,6 +435,8 @@ public:
 	virtual int get_device() const = 0;
 	virtual void set_volume(float volume) = 0;
 	virtual float get_volume() const = 0;
+	virtual bool set_voice_processing(bool enabled) = 0; // Echo cancellation and noise suppression where the platform provides it, currently only Android.
+	virtual bool get_voice_processing() const = 0;
 	static microphone* create(int device, audio_engine* engine);
 };
 

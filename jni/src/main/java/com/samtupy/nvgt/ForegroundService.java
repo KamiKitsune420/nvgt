@@ -1,5 +1,6 @@
 package com.samtupy.nvgt;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -8,6 +9,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -19,6 +21,7 @@ import android.os.PowerManager;
 // Scripts start and stop it with android_start_foreground_service() and android_stop_foreground_service().
 // The app's AndroidManifest.xml has to declare the service (android:foregroundServiceType="mediaPlayback") and the
 // FOREGROUND_SERVICE, FOREGROUND_SERVICE_MEDIA_PLAYBACK, WAKE_LOCK and POST_NOTIFICATIONS permissions.
+// The build.android_foreground_service configuration option makes NVGT add all of that when it builds a game.
 public class ForegroundService extends Service {
 	private static final String CHANNEL_ID = "nvgt_foreground";
 	private static final int NOTIFICATION_ID = 1422;
@@ -74,9 +77,21 @@ public class ForegroundService extends Service {
 			.setCategory(Notification.CATEGORY_SERVICE);
 		if (open != null) builder.setContentIntent(open);
 		Notification notification = builder.build();
+		// If the user has let the app record audio, the service also says it uses the microphone, which is what lets recording carry on in the background.
+		// That only works if the manifest declares it too (foregroundServiceType="mediaPlayback|microphone" and the FOREGROUND_SERVICE_MICROPHONE permission), so fall back to playback alone if Android refuses.
+		boolean microphone = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+		boolean started = false;
+		if (microphone) {
+			try {
+				startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK | ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+				started = true;
+			} catch (Exception e) { }
+		}
 		try {
-			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-			else startForeground(NOTIFICATION_ID, notification);
+			if (!started) {
+				if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+				else startForeground(NOTIFICATION_ID, notification);
+			}
 		} catch (Exception e) {
 			// Android refused (for example, the manifest doesn't declare the service type). Nothing more can be done here.
 			stopSelf();

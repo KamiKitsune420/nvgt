@@ -233,6 +233,12 @@ void android_permission_request_callback(void* raw_data, const char* permission,
 bool request_android_permission(const std::string& permission, asIScriptFunction* callback, const std::string& callback_data) {
 	android_permission_request_callback_data* data = new android_permission_request_callback_data(callback, callback_data);
 	bool result = SDL_RequestAndroidPermission(permission.c_str(), android_permission_request_callback, data);
+	if (!result) {
+		// The request was never made, so nothing is going to answer it.
+		if (callback) callback->Release();
+		delete data;
+		return false;
+	}
 	if (!callback) {
 		data->completed.wait();
 		result = data->was_granted;

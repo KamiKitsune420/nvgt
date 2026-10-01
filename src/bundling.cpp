@@ -35,6 +35,7 @@
 #include <Poco/TemporaryFile.h>
 #include <Poco/Timestamp.h>
 #include <Poco/Util/Application.h>
+#include <algorithm>
 #include <archive.h>
 #include <archive_entry.h>
 #include <plist/plist.h>
@@ -805,6 +806,39 @@ class nvgt_compilation_output_android : public nvgt_compilation_output_impl {
 		// For better or worse, we've done what we can and if we haven't found build tools by now the end user must have some real whacked out system or Android SDK installation.
 		if (!android_sdk_tools_exist(path)) throw Exception(format("unable to find all Android development tools in detected SDK installation directories %s", buildtools_bin));
 	}
+	void add_manifest_requests(string& manifest) {
+		// Adds what the game has asked for in its configuration to the manifest: any permissions in build.android_permissions, and the declarations that android_start_foreground_service needs if build.android_foreground_service is set.
+		// A permission can be given by its full name or just the last part, for example RECORD_AUDIO for android.permission.RECORD_AUDIO.
+		vector<string> permissions;
+		StringTokenizer requested(config.getString("build.android_permissions", ""), ",; ", StringTokenizer::TOK_TRIM | StringTokenizer::TOK_IGNORE_EMPTY);
+		for (const string& permission : requested) permissions.push_back(permission.find('.') == string::npos ? "android.permission." + toUpper(permission) : permission);
+		// The stock manifest mentions some permissions inside of comments, which must not be mistaken for the real thing.
+		string uncommented = manifest;
+		for (size_t start = uncommented.find("<!--"); start != string::npos; start = uncommented.find("<!--", start)) {
+			size_t end = uncommented.find("-->", start);
+			uncommented.erase(start, end == string::npos ? string::npos : end + 3 - start);
+		}
+		bool microphone = std::find(permissions.begin(), permissions.end(), "android.permission.RECORD_AUDIO") != permissions.end() || uncommented.find("\"android.permission.RECORD_AUDIO\"") != string::npos;
+		bool foreground_service = config.hasOption("build.android_foreground_service");
+		if (foreground_service) {
+			for (const char* permission : {"FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "WAKE_LOCK", "POST_NOTIFICATIONS"}) permissions.push_back("android.permission."s + permission);
+			if (microphone) permissions.push_back("android.permission.FOREGROUND_SERVICE_MICROPHONE"); // Lets the game keep recording while it is in the background.
+		}
+		if (permissions.empty()) return;
+		string additions;
+		for (const string& permission : permissions) {
+			if (uncommented.find("\"" + permission + "\"") != string::npos || additions.find("\"" + permission + "\"") != string::npos) continue;
+			additions += "    <uses-permission android:name=\"" + permission + "\" />\n";
+		}
+		if (microphone && uncommented.find("\"android.hardware.microphone\"") == string::npos) additions += "    <uses-feature android:name=\"android.hardware.microphone\" android:required=\"false\" />\n";
+		size_t application = manifest.find("<application");
+		if (application == string::npos) throw Exception("unable to add permissions to AndroidManifest.xml, it has no application element");
+		manifest.insert(application, additions);
+		if (!foreground_service || uncommented.find("com.samtupy.nvgt.ForegroundService") != string::npos) return;
+		size_t application_end = manifest.rfind("</application>");
+		if (application_end == string::npos) throw Exception("unable to add the foreground service to AndroidManifest.xml, it has no end to its application element");
+		manifest.insert(application_end, "    <service android:name=\"com.samtupy.nvgt.ForegroundService\" android:exported=\"false\" android:foregroundServiceType=\""s + (microphone ? "mediaPlayback|microphone" : "mediaPlayback") + "\" />\n    ");
+	}
 	unsigned int parse_adb_devices_l(const string& line, string& device_description) {
 		// Parses a line of output from `adb devices -l` and returns important information.
 		StringTokenizer parts(line, " ");
@@ -874,6 +908,7 @@ protected:
 		StreamCopier::copyToString(input_manifest, manifest);
 		input_manifest.close();
 		replaceInPlace(manifest, "%APP_LABEL%"s, product_name);
+		add_manifest_requests(manifest);
 		FileOutputStream output_manifest(Path(workplace.path()).append("AndroidManifest.xml").toString());
 		output_manifest.write(manifest.c_str(), manifest.size());
 		output_manifest.close();

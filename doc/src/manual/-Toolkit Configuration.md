@@ -112,11 +112,13 @@ This section contains options that typically control some aspect of the user int
 #### build
 This section contains options that are directly related to the compiling/bundling of an NVGT game into it's final package. It contains everything from options that help NVGT find extra build tools for certain platforms to those that define the name and version of your product.
 
+* android_foreground_service: adds what android_start_foreground_service needs to the app's manifest, namely the service itself and the permissions to run it, show its notification and keep the device awake (if the app can also record audio, the service is allowed to keep recording in the background)
 * android_home string defaults to %ANDROID_HOME%: path to the root directory of the Android sdk
 * android_install = integer default 1: should Android apks be installed onto connected devices if signing was successful, 0 no, 1 ask, 2 always
 * android_jaava_home string defaults to %JAVA_HOME%: path to the root of a java installation
 * android_manifest string defaults to prepackaged: path to a custom AndroidManifest.xml file that should be packaged with an APK file instead of the builtin template
 * android_path string defaults to %PATH%: where to look for android development tools
+* android_permissions = string: a list of extra permissions the app needs separated by commas or spaces, either full names or just the last part (RECORD_AUDIO is the same as android.permission.RECORD_AUDIO and is needed to use the microphone)
 * android_signature_cert = string: path to a .keystore file used to sign an Android apk bundle
 * android_signature_password = string: password used to access the given signing keystore (see remarks at the bottom of this article)
 * linux_bundle = integer default 2: 0 no bundle, 1 folder, 2 .zip, 3 both folder and .zip
