@@ -1647,15 +1647,19 @@ class sound_impl final : public mixer_impl, public virtual sound {
 		sound_impl* owner;
 	} async_notification_callbacks;
 	// MiniAudio will start a sound that is still being decoded, and plays what it hasn't reached yet as silence while moving on through it, so
-	// a sound played straight after load() lost its first few milliseconds. A sound asked to play before its load has finished starts the
-	// moment it does instead. start_mutex makes "is it loaded? then start, else leave word" one step against the job thread finishing.
+	// a sound played straight after load() lost its first few milliseconds. A sound asked to play before its first frames can be read starts
+	// the moment they can instead: the load's init notification, which comes after the first page is decoded. Not its done notification,
+	// which waits for the whole file and held every sound back by however long it takes to decode, seconds for a long one.
+	// start_mutex makes "is it readable? then start, else leave word" one step against the job thread.
 	std::mutex start_mutex;
 	std::atomic<bool> start_pending {false};
 	std::string pcm_buffer;      // When loading from raw PCM (like TTS) we store the intermediate wav data here so we can take advantage of async loading to return quickly. Makes a substantial difference in the responsiveness of TTS calls.
 	std::string loaded_filename; // Contains the loaded filename as passed in the load/stream method, used just for convenience.
 	ma_fence fence;
-	async_notification_callbacks notification_callbacks;
+	async_notification_callbacks notification_callbacks; // done: the whole file is decoded
 	mutable std::atomic_flag load_completed;
+	async_notification_callbacks readable_callbacks;     // init: the first frames can be read
+	std::atomic_flag readable;
 	unique_ptr<ma_pcm_rb> pcm_stream;
 	bool paused;
 	bool should_autoclose; // If this is true, the release method defers sound destruction until playback has complete.
@@ -1669,7 +1673,10 @@ class sound_impl final : public mixer_impl, public virtual sound {
 		ma_sound_set_directional_attenuation_factor(&*snd, 0);
 		attach_output_bus(0, node_chain, 0);
 		// If we didn't load our sound asynchronously or if we streamed it, then we simply mark it as load_completed or we'll end up with a deadlock at destruction time.
-		if (!async_load) load_completed.test_and_set();
+		if (!async_load) {
+			load_completed.test_and_set();
+			readable.test_and_set();
+		}
 	}
 public:
 	static void async_notification_callback(ma_async_notification *pNotification) {
@@ -1686,7 +1693,7 @@ public:
 		prime_environment();
 		{
 			lock_guard<mutex> lock(start_mutex);
-			if (!load_completed.test()) {
+			if (!readable.test() && !load_completed.test()) {
 				if (looped || reset_loop_state) ma_sound_set_looping(&*snd, looped ? MA_TRUE : MA_FALSE);
 				start_pending = true;
 				return true;
@@ -1710,6 +1717,9 @@ public:
 		notification_callbacks.cb.onSignal = &async_notification_callback;
 		notification_callbacks.pAtomicFlag = &load_completed;
 		notification_callbacks.owner = this;
+		readable_callbacks.cb.onSignal = &async_notification_callback;
+		readable_callbacks.pAtomicFlag = &readable;
+		readable_callbacks.owner = this;
 	}
 	~sound_impl() {
 		close();
@@ -1740,6 +1750,7 @@ public:
 		ma_resource_manager_pipeline_notifications notifications = ma_resource_manager_pipeline_notifications_init();
 		notifications.done.pFence = &fence;
 		notifications.done.pNotification = &notification_callbacks;
+		notifications.init.pNotification = &readable_callbacks;
 		cfg.flags = ma_flags;
 		cfg.pFilePath = triplet.c_str();
 		cfg.initNotifications = notifications;
@@ -1907,6 +1918,7 @@ public:
 		pcm_buffer.resize(0);
 		loaded_filename.clear();
 		load_completed.clear();
+		readable.clear();
 		paused = should_autoclose = false;
 		return true;
 	}
