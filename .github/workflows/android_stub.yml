@@ -42,7 +42,8 @@ jobs:
     - name: build
       run: |
         pip3 install scons --break-system-packages
-        scons target=android
+        # opus is linked into the stub: Android only unpacks libraries named lib*.so from an app, so opus.so beside libgame.so is never there to load on a real phone.
+        scons target=android static_opus_plugin=1
         cd jni
         ./gradlew assembleRunnerRelease AssembleStubRelease --no-daemon -Pandroid.injected.signing.store.file=android.keystore -Pandroid.injected.signing.store.password=Android1422207 -Pandroid.injected.signing.key.alias=app -Pandroid.injected.signing.key.password=Android1422207
         cd ..
