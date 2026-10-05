@@ -262,6 +262,12 @@ bool audioform_touch_finger_cancel(uint64 device, const touch_finger&inout finge
 }
 // The on-screen keyboard belongs to one input box at a time, which these identify. A serial of 0 means that no form has brought the keyboard up.
 uint audioform_serial_counter = 0;
+// When a form was last on screen as the platform's own controls (native_form.nvgt), or 0 if none is. While one is, the screen reader reads those controls and the on-screen keyboard belongs to them, so audio forms say nothing and leave the keyboard alone.
+// A form has no way to say that it is finished with, so one that has not been monitored for half a second no longer counts.
+uint64 audioform_native_time = 0;
+bool audioform_native_showing() {
+	return audioform_native_time > 0 and ticks() - audioform_native_time < 500;
+}
 uint audioform_keyboard_form = 0;
 int audioform_keyboard_control = -1;
 void audioform_show_screen_keyboard() {
@@ -276,7 +282,7 @@ void audioform_hide_screen_keyboard() {
 }
 // Called by a form each time it is monitored, shows or hides the on-screen keyboard as focus moves in and out of editable input boxes.
 void audioform_update_screen_keyboard(audio_form@ f) {
-	if (!SCREEN_KEYBOARD_SUPPORTED or !audioform_screen_keyboard) return;
+	if (!SCREEN_KEYBOARD_SUPPORTED or !audioform_screen_keyboard or audioform_native_showing()) return;
 	uint serial;
 	int control_index;
 	if (!f.get_screen_keyboard_target(serial, control_index)) {
@@ -2794,16 +2800,21 @@ class audio_form {
 	}
 	*/
 	//internal properties
+	// Everything a form says goes through here, so that it can keep quiet while it is shown as native controls.
+	bool speak(const string&in text, bool interrupt = tts_default_interrupt, text_processing_callback@ processing_callback = tts_default_text_processing_callback) {
+		if (audioform_native_showing()) return true;
+		return ::speak(text, interrupt, processing_callback);
+	}
 	bool subform = false;
-	private uint form_serial = ++audioform_serial_counter;
-	private int speech_output;
+	protected uint form_serial = ++audioform_serial_counter;
+	protected int speech_output;
 	int default_echo_flag = audioform_keyboard_echo;
-	private control[] c_form;
-	private int form_error;
-	private int control_counter;
-	private int active_controls;
-	private int control_focus;
-	private tts_voice@ ui_speech;
+	protected control[] c_form;
+	protected int form_error;
+	protected int control_counter;
+	protected int active_controls;
+	protected int control_focus;
+	protected tts_voice@ ui_speech;
 }
 //Control class
 //This is an internal class and should not be used by the application.
@@ -4269,6 +4280,11 @@ class control {
 	return screen_reader_speak(speech_output, text);
 	}
 	*/
+	// Everything a form says goes through here, so that it can keep quiet while it is shown as native controls.
+	bool speak(const string&in text, bool interrupt = tts_default_interrupt, text_processing_callback@ processing_callback = tts_default_text_processing_callback) {
+		if (audioform_native_showing()) return true;
+		return ::speak(text, interrupt, processing_callback);
+	}
 }
 class list_item {
 	string item;

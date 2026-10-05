@@ -37,6 +37,9 @@ bool android_vibrate(int duration, int strength);
 bool android_vibrate_pattern(const std::vector<int>& timings, const std::vector<int>& strengths, int repeat);
 bool android_vibrate_effect(int effect);
 bool android_cancel_vibration();
+bool native_ui_available();
+bool native_ui_send(const std::string& message);
+std::string native_ui_receive();
 
 // JNI Helpers
 class JNIException : public std::runtime_error {

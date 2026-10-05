@@ -1,0 +1,360 @@
+/* native_form.nvgt - an audio_form shown as the platform's own controls
+ *
+ * A native_form is an audio_form, with the same methods doing the same things, so one can stand wherever the other does. Where the platform can show real controls (Android so far), the form is also put on screen as those: buttons, edit boxes, checkboxes, lists and sliders that the screen reader reads and the on-screen keyboard types into like in any other app. Where it can't, or with native_form_mode set to never, it is exactly an audio_form.
+ *
+ * The audio_form underneath stays the truth. Each time the form is monitored, what the user did to the controls is applied to it (a tap on a button presses it, typing sets the text), and anything the script changed is sent to the screen. While it is on screen the form says nothing itself.
+ * Double tapping a list item, or the keyboard's done key in a one line input box, is the enter key, and the back button is escape: they are pressed as those keys, so a form's default and cancel buttons, and any code of the game's own that looks for those keys, work as they do with a keyboard.
+ *
+ * Not shown natively: keyboard areas and subforms, which leave a gap, and the characters an input box refuses to take. A form goes on screen when it is first monitored, and is taken off when it is reset or destroyed, or when it has not been monitored for most of a second; monitoring it again puts it back.
+ *
+ * The controls themselves are made by a backend that takes messages and gives back events, both lists of fields separated by character 31:
+ *	open id title, close id, alive id, title id title, count id controls
+ *	control id index type flags label, where type is button, input, checkbox, list, slider, progress, text or none, and flags add up 1 enabled, 2 visible, 4 read only, 8 multiline, 16 password
+ *	label id index label, state id index flags, text id index text, check id index 0/1, items id index position item..., select id index position, range id index minimum maximum step value, progress id index percent, focus id index
+ * and back: click id index, check id index 0/1, text id index text, select id index position, activate id index position, value id index value, submit id index, focus id index, cancel id.
+ * The engine's is native_ui_send and native_ui_receive. A script can supply another by setting native_form_custom_backend.
+ *
+ * NVGT - NonVisual Gaming Toolkit
+ * This software is provided "as-is", without any express or implied warranty. In no event will the authors be held liable for any damages arising from the use of this software.
+*/
+
+#include "form.nvgt"
+
+enum native_form_modes {
+	native_form_auto = 0, // Native controls when a screen reader is running to read them, an audio form otherwise.
+	native_form_always,
+	native_form_never
+}
+int native_form_mode = native_form_auto;
+
+interface native_form_backend {
+	bool available();
+	bool send(const string&in message);
+	string receive();
+}
+native_form_backend@ native_form_custom_backend = null;
+
+const string NATIVE_FORM_SEPARATOR = "\x1f";
+enum native_form_flags {
+	native_form_flag_enabled = 1,
+	native_form_flag_visible = 2,
+	native_form_flag_read_only = 4,
+	native_form_flag_multiline = 8,
+	native_form_flag_password = 16
+}
+
+int native_form_id_counter = 0;
+int[] native_form_ids; // The forms that are open as native controls.
+string[] native_form_events; // Received and waiting for their form to be monitored.
+
+bool native_form_available() {
+	if (@native_form_custom_backend != null) return native_form_custom_backend.available();
+	return native_ui_available();
+}
+// Whether a form created now would be shown as native controls.
+bool native_form_wanted() {
+	if (native_form_mode == native_form_never or !native_form_available()) return false;
+	return native_form_mode == native_form_always or screen_reader_detect() != "";
+}
+bool native_form_send(const string&in message) {
+	if (@native_form_custom_backend != null) return native_form_custom_backend.send(message);
+	return native_ui_send(message);
+}
+void native_form_receive() {
+	while (true) {
+		string e = @native_form_custom_backend != null ? native_form_custom_backend.receive() : native_ui_receive();
+		if (e == "") break;
+		string[]@ f = e.split(NATIVE_FORM_SEPARATOR);
+		if (f.length() > 1 and native_form_ids.find(int(parse_int(f[1]))) > -1) native_form_events.insert_last(e);
+	}
+}
+
+// What was last sent to the screen about one control, to tell what has changed since. This is an internal class and should not be used by the application.
+class native_form_shadow {
+	string type;
+	int structure = -1; // The flags that a control has to be made again to change.
+	string label;
+	int flags = -1;
+	string text;
+	bool has_text = false;
+	int checked = -1;
+	string[] items;
+	int position = -2;
+	double value, minimum, maximum, step = -1;
+	int progress = -1;
+}
+
+class native_form : audio_form {
+	// None of these may be given a starting value here: audio_form's constructor calls reset() before that would happen, and what reset() learned would be overwritten.
+	protected int native_id;
+	protected native_form_shadow@[] native_shadow;
+	protected int native_focus;
+	protected uint64 native_sync_time;
+	protected uint64 native_alive_time;
+	protected uint64 native_monitor_time;
+	protected bool native_opened; // A form goes on screen when it is first monitored, since many are built long before they are used.
+	protected string native_title;
+	~native_form() {
+		native_close();
+	}
+	// True while this form is on screen as native controls.
+	bool get_is_native() property {
+		return native_id != 0;
+	}
+	void create_window() override {
+		create_window("", false, false, true);
+	}
+	void create_window(string window_title, bool change_screen_title = true, bool say_dialog = true, bool silent = false) override {
+		native_title = window_title;
+		if (native_id != 0 and native_opened) native_form_send("title" + NATIVE_FORM_SEPARATOR + native_id + NATIVE_FORM_SEPARATOR + window_title);
+		else if (native_id == 0 and native_form_wanted()) {
+			native_id = ++native_form_id_counter;
+			native_form_ids.insert_last(native_id);
+			native_shadow.resize(0);
+			native_focus = -1;
+			native_sync_time = 0;
+			native_opened = false;
+		}
+		native_quiet();
+		audio_form::create_window(window_title, change_screen_title, say_dialog, silent);
+	}
+	// These are where a form speaks without being monitored, which it must not do if it is about to be on screen.
+	bool focus(int control_id) override {
+		native_quiet();
+		return audio_form::focus(control_id);
+	}
+	bool focus_interrupt(int control_id) override {
+		native_quiet();
+		return audio_form::focus_interrupt(control_id);
+	}
+	bool set_list_position(int control_index, int position = -1, bool speak_new_item = false) override {
+		native_quiet();
+		return audio_form::set_list_position(control_index, position, speak_new_item);
+	}
+	protected void native_quiet() {
+		if (native_id != 0) audioform_native_time = ticks();
+	}
+	void reset(bool reset_to_default_keyboard_echo = true) override {
+		native_close();
+		audio_form::reset(reset_to_default_keyboard_echo);
+	}
+	// Takes the form off the screen without changing anything about it, for when it is finished with but kept. Creating its window again puts it back.
+	void native_close() {
+		if (native_id == 0) return;
+		if (native_opened) native_form_send("close" + NATIVE_FORM_SEPARATOR + native_id);
+		int idx = native_form_ids.find(native_id);
+		if (idx > -1) native_form_ids.remove_at(idx);
+		for (int i = native_form_events.length() - 1; i >= 0; i--) {
+			string[]@ f = native_form_events[i].split(NATIVE_FORM_SEPARATOR);
+			if (f.length() > 1 and parse_int(f[1]) == native_id) native_form_events.remove_at(i);
+		}
+		native_id = 0;
+		if (native_form_ids.length() < 1) audioform_native_time = 0;
+	}
+	int monitor() override {
+		if (native_id == 0) return audio_form::monitor();
+		uint64 now = ticks();
+		audioform_native_time = now;
+		if (!native_opened) {
+			native_opened = true;
+			native_alive_time = now;
+			native_form_send("open" + NATIVE_FORM_SEPARATOR + native_id + NATIVE_FORM_SEPARATOR + native_title);
+		} else if (now - native_monitor_time > 600) {
+			// The form was left alone for long enough to have been taken off the screen. It is back now, and has to be told again where focus is.
+			native_focus = -1;
+			native_sync_time = 0;
+		}
+		native_monitor_time = now;
+		if (now - native_alive_time >= 150) {
+			native_alive_time = now;
+			native_form_send("alive" + NATIVE_FORM_SEPARATOR + native_id);
+		}
+		native_form_receive();
+		for (uint i = 0; i < native_form_events.length() and native_id != 0; ) {
+			string[]@ f = native_form_events[i].split(NATIVE_FORM_SEPARATOR);
+			if (parse_int(f[1]) != native_id) {
+				i++;
+				continue;
+			}
+			native_form_events.remove_at(i);
+			native_event(f);
+		}
+		int result = audio_form::monitor();
+		// A callback may have closed the form.
+		if (native_id != 0 and (native_sync_time == 0 or now - native_sync_time >= 50)) {
+			native_sync_time = now;
+			native_sync();
+		}
+		return result;
+	}
+	// Sends everything about the form that the screen doesn't show yet. monitor() does this, a script only needs to if it wants a change seen before it next monitors the form.
+	void native_sync() {
+		if (native_id == 0 or !native_opened) return;
+		string head = NATIVE_FORM_SEPARATOR + native_id + NATIVE_FORM_SEPARATOR;
+		if (native_shadow.length() > c_form.length()) {
+			native_shadow.resize(c_form.length());
+			native_form_send("count" + head + c_form.length());
+		}
+		for (uint i = 0; i < c_form.length(); i++) {
+			if (i >= native_shadow.length()) native_shadow.insert_last(native_form_shadow());
+			native_form_shadow@ s = native_shadow[i];
+			control@ c = c_form[i];
+			string at = head + i + NATIVE_FORM_SEPARATOR;
+			string type = native_type(c);
+			int flags = 0;
+			if (c.enabled) flags |= native_form_flag_enabled;
+			if (c.visible and c.active) flags |= native_form_flag_visible;
+			if (c.read_only) flags |= native_form_flag_read_only;
+			if (c.multiline) flags |= native_form_flag_multiline;
+			if (c.password_mask != "") flags |= native_form_flag_password;
+			int structure = flags & (native_form_flag_read_only | native_form_flag_multiline | native_form_flag_password);
+			string label = c.caption.replace("&", "", true);
+			if (c.type == ct_status_bar) label += " " + c.text;
+			if (type != s.type or structure != s.structure) {
+				@s = native_form_shadow();
+				@native_shadow[i] = s;
+				s.type = type;
+				s.structure = structure;
+				s.label = label;
+				s.flags = flags;
+				native_form_send("control" + at + type + NATIVE_FORM_SEPARATOR + flags + NATIVE_FORM_SEPARATOR + label);
+			}
+			if (label != s.label) {
+				s.label = label;
+				native_form_send("label" + at + label);
+			}
+			if (flags != s.flags) {
+				s.flags = flags;
+				native_form_send("state" + at + flags);
+			}
+			if (c.type == ct_input and (!s.has_text or c.text != s.text)) {
+				s.has_text = true;
+				s.text = c.text;
+				native_form_send("text" + at + c.text);
+			} else if (c.type == ct_checkbox and (c.checked ? 1 : 0) != s.checked) {
+				s.checked = c.checked ? 1 : 0;
+				native_form_send("check" + at + s.checked);
+			} else if (c.type == ct_progress and c.progress != s.progress) {
+				s.progress = c.progress;
+				native_form_send("progress" + at + c.progress);
+			} else if (c.type == ct_slider) {
+				if (c.slider_value != s.value or c.slider_minimum_value != s.minimum or c.slider_maximum_value != s.maximum or c.slider_step_size != s.step) {
+					s.value = c.slider_value;
+					s.minimum = c.slider_minimum_value;
+					s.maximum = c.slider_maximum_value;
+					s.step = c.slider_step_size;
+					native_form_send("range" + at + s.minimum + NATIVE_FORM_SEPARATOR + s.maximum + NATIVE_FORM_SEPARATOR + s.step + NATIVE_FORM_SEPARATOR + s.value);
+				}
+				string text;
+				if (!c.slider_text_values.get(c.slider_value, text)) text = "";
+				if (!s.has_text or text != s.text) {
+					s.has_text = true;
+					s.text = text;
+					native_form_send("text" + at + text);
+				}
+			} else if (c.type == ct_list) {
+				bool changed = s.position == -2 or s.items.length() != c.list.length();
+				for (uint j = 0; !changed and j < c.list.length(); j++) changed = native_item(c, j) != s.items[j];
+				if (changed) {
+					s.items.resize(c.list.length());
+					string message = "items" + at + c.list_position;
+					for (uint j = 0; j < c.list.length(); j++) {
+						s.items[j] = native_item(c, j);
+						message += NATIVE_FORM_SEPARATOR + s.items[j];
+					}
+					s.position = c.list_position;
+					native_form_send(message);
+				} else if (c.list_position != s.position) {
+					s.position = c.list_position;
+					native_form_send("select" + at + c.list_position);
+				}
+			}
+		}
+		if (control_focus != native_focus) {
+			native_focus = control_focus;
+			if (control_focus > -1) native_form_send("focus" + head + control_focus);
+		}
+	}
+	protected string native_type(control@ c) {
+		if (!c.active) return "none";
+		switch (c.type) {
+			case ct_button: case ct_link: return "button";
+			case ct_input: return "input";
+			case ct_checkbox: return "checkbox";
+			case ct_list: return "list";
+			case ct_slider: return "slider";
+			case ct_progress: return "progress";
+			case ct_status_bar: return "text";
+		}
+		return "none";
+	}
+	// A list item as the screen shows it. The separator can't be part of one.
+	protected string native_item(control@ c, uint index) {
+		string item = c.list[index].item.replace(NATIVE_FORM_SEPARATOR, " ", true);
+		if (c.list_multiselect and c.list[index].checked) item += ", " + c.highlight_selection_speech_text;
+		return item;
+	}
+	protected void native_press(int key) {
+		simulate_key_down(key);
+		simulate_key_up(key);
+	}
+	// Something the user did to a control: it is done to the audio form as the same thing done with a keyboard would be, callbacks included.
+	protected void native_event(string[]@ f) {
+		if (f[0] == "cancel") {
+			native_press(KEY_ESCAPE);
+			return;
+		}
+		if (f.length() < 3) return;
+		int i = parse_int(f[2]);
+		if (i < 0 or i >= c_form.length() or i >= native_shadow.length()) return;
+		control@ c = c_form[i];
+		native_form_shadow@ s = native_shadow[i];
+		if (!c.active or !c.enabled or !c.visible) return;
+		if (i != control_focus) {
+			focus_silently(i);
+			if (native_id == 0) return;
+		}
+		native_focus = control_focus; // The screen is already there.
+		string value = f.length() > 3 ? f[3] : "";
+		if (f[0] == "click" and (c.type == ct_button or c.type == ct_link)) {
+			if (@c.event_callback == null or c.event_callback(this, i, event_button, {}) == 0) c.pressed = true;
+		} else if (f[0] == "check" and c.type == ct_checkbox) {
+			s.checked = value == "1" ? 1 : 0;
+			if (c.read_only or @c.event_callback != null and c.event_callback(this, i, event_checkbox, {}) == 1) return; // The next sync puts the box back as it was.
+			c.checked = value == "1";
+		} else if (f[0] == "text" and c.type == ct_input) {
+			// The text itself may hold the separator.
+			for (uint j = 4; j < f.length(); j++) value += NATIVE_FORM_SEPARATOR + f[j];
+			s.text = value;
+			if (c.read_only) return;
+			value = value.replace("\r", "", true);
+			if (c.max_length > 0 and value.length() > c.max_length) value = value.substr(0, c.max_length);
+			c.text = value;
+			c.cursor = value.length();
+			c.sel_start = -1;
+			c.sel_end = -1;
+		} else if ((f[0] == "select" or f[0] == "activate") and c.type == ct_list) {
+			int position = parse_int(value);
+			if (position < 0 or position >= c.list.length()) return;
+			s.position = position;
+			if (position != c.list_position) {
+				int old = c.list_position;
+				c.list_position = position;
+				if (@c.event_callback != null and c.event_callback(this, i, event_list_cursor, {}) == 1) {
+					c.list_position = old;
+					return;
+				}
+			}
+			if (f[0] == "activate") native_press(KEY_RETURN);
+		} else if (f[0] == "value" and c.type == ct_slider) {
+			double v = parse_float(value);
+			if (v < c.slider_minimum_value) v = c.slider_minimum_value;
+			if (v > c.slider_maximum_value) v = c.slider_maximum_value;
+			s.value = v;
+			if (v == c.slider_value) return;
+			double old = c.slider_value;
+			c.slider_value = v;
+			if (@c.event_callback != null and c.event_callback(this, i, event_slider, {{"increment", v - old}, {"value", v}}) == 1) c.slider_value = old;
+		} else if (f[0] == "submit") native_press(KEY_RETURN);
+	}
+}

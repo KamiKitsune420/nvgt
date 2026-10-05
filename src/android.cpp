@@ -629,4 +629,66 @@ unsigned long long system_running_milliseconds() {
 	return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+// Forms made of the phone's own controls, through com.samtupy.nvgt.NativeForm. A script sends it messages and polls it for events; text crosses as UTF-8 bytes, since JNI's own strings can't carry every character.
+static jclass NativeFormClass = nullptr;
+static jmethodID android_native_form_method(JNIEnv*& env, const char* name, const char* signature) {
+	env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return nullptr;
+	if (!NativeFormClass) {
+		LocalRef<jclass> cls(env, env->FindClass("com/samtupy/nvgt/NativeForm"));
+		if (!cls.get()) {
+			env->ExceptionClear();
+			return nullptr;
+		}
+		NativeFormClass = (jclass)env->NewGlobalRef(cls.get());
+		if (!NativeFormClass) return nullptr;
+	}
+	jmethodID mid = env->GetStaticMethodID(NativeFormClass, name, signature);
+	if (!mid) env->ExceptionClear();
+	return mid;
+}
+bool native_ui_available() {
+	JNIEnv* env;
+	jmethodID mid = android_native_form_method(env, "available", "()Z");
+	if (!mid) return false;
+	bool result = env->CallStaticBooleanMethod(NativeFormClass, mid);
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+bool native_ui_send(const std::string& message) {
+	JNIEnv* env;
+	jmethodID mid = android_native_form_method(env, "send", "(Landroid/app/Activity;[B)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	LocalRef<jbyteArray> bytes(env, env->NewByteArray(message.size()));
+	if (!bytes.get()) {
+		env->ExceptionClear();
+		return false;
+	}
+	if (!message.empty()) env->SetByteArrayRegion(bytes.get(), 0, message.size(), (const jbyte*)message.data());
+	bool result = env->CallStaticBooleanMethod(NativeFormClass, mid, activity.get(), bytes.get());
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+std::string native_ui_receive() {
+	JNIEnv* env;
+	jmethodID mid = android_native_form_method(env, "receive", "()[B");
+	if (!mid) return "";
+	LocalRef<jbyteArray> bytes(env, (jbyteArray)env->CallStaticObjectMethod(NativeFormClass, mid));
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return "";
+	}
+	if (!bytes.get()) return "";
+	std::string result(env->GetArrayLength(bytes.get()), '\0');
+	if (!result.empty()) env->GetByteArrayRegion(bytes.get(), 0, result.size(), (jbyte*)result.data());
+	return result;
+}
+
 #endif // __ANDROID__
