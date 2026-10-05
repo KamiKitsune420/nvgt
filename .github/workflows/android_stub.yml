@@ -1,0 +1,54 @@
+# Builds NVGT for Android only, for Eleutheria's phone build. Started by hand (Actions tab, or gh workflow run android_stub).
+# Like linux_stub.yml and unlike release.yml, it doesn't generate user/nvgt_config.h, so the build uses NVGT's default bytecode settings (src/nvgt_config.h).
+# That's what our Windows nvgt.exe uses, so a game compiled on Windows with -p android loads on the Android stub from here.
+# The artifact, android_stub, holds stub/nvgt_android.bin and lib_android/, which go into the same folders of the NVGT install.
+name: android_stub
+on:
+  workflow_dispatch:
+jobs:
+  android_build:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        submodules: true
+    - uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        cache: 'gradle'
+    - uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r27
+        link-to-sdk: true
+        add-to-path: true
+    - name: set ndk environ
+      run: echo "ANDROID_NDK_HOME=${{steps.setup-ndk.outputs.ndk-path}}" >> $GITHUB_ENV
+    - uses: actions/cache@v4
+      with:
+        path: droidev
+        # The same key as release.yml, so the Android libraries it built are reused instead of rebuilt.
+        key: droidev-${{ hashFiles('.github/workflows/release.yml', 'vcpkg/ports/**', 'vcpkg/triplets/**', 'vcpkg/*.json', '.git/modules/vcpkg/bin/HEAD') }}
+      id: cache
+    - name: build dependencies
+      if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+      run: python3 vcpkg/build_dependencies.py --archive arm64-android
+    - name: keystore
+      run: |
+        cd jni
+        keytool -genkey -keyalg RSA -keysize 2048 -v -keystore android.keystore -dname cn=NVGT -storepass Android1422207 -validity 10000 -alias app
+        cd ..
+    - name: build
+      run: |
+        pip3 install scons --break-system-packages
+        scons target=android
+        cd jni
+        ./gradlew assembleRunnerRelease AssembleStubRelease --no-daemon -Pandroid.injected.signing.store.file=android.keystore -Pandroid.injected.signing.store.password=Android1422207 -Pandroid.injected.signing.key.alias=app -Pandroid.injected.signing.key.password=Android1422207
+        cd ..
+    - uses: actions/upload-artifact@v7
+      with:
+        name: android_stub
+        path: |
+          release/stub
+          release/lib_android

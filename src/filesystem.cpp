@@ -246,8 +246,16 @@ bool FileExists(const string& path) {
 	#else
 	// Check if the path exists and is a file
 	struct stat st;
-	if (stat(path.c_str(), &st) == -1)
+	if (stat(path.c_str(), &st) == -1) {
+		#ifdef __ANDROID__
+		// A game's bundled assets are inside the APK, where stat can't see them, though they open by their relative path like any file. Without this a game that checks for a sound before playing it finds none of them.
+		if (SDL_IOStream* asset = SDL_IOFromFile(path.c_str(), "rb")) {
+			SDL_CloseIO(asset);
+			return true;
+		}
+		#endif
 		return false;
+	}
 	if ((st.st_mode & S_IFDIR) != 0)
 		return false;
 	return true;
