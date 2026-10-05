@@ -45,6 +45,7 @@ public final class NativeForm {
 		TextView label; // The caption above an input box, a list or a slider.
 		View widget; // The part that takes focus.
 		ArrayList<TextView> items = new ArrayList<>();
+		LinearLayout itemHost; // Where a list's items go: the row itself, or for tabs a strip across it.
 		int selected = -1;
 		double min = 0, max = 100, step = 1;
 		boolean quiet; // True while the script's own change is being applied, which is not something to tell it about.
@@ -56,6 +57,7 @@ public final class NativeForm {
 		LinearLayout column;
 		ArrayList<Control> controls = new ArrayList<>();
 		long alive; // When the script last said anything about this form.
+		long opened;
 	}
 
 	// A script has no way to say that a form is finished with: it just stops looking at it. So a form that has not been heard from for a while is taken off the screen, and comes back if the script returns to it.
@@ -70,6 +72,7 @@ public final class NativeForm {
 				long now = android.os.SystemClock.uptimeMillis();
 				for (Form form : forms.values()) {
 					if (now - form.alive > ALIVE_TIME && form.dialog.isShowing()) form.dialog.hide();
+					else if (now - form.alive <= ALIVE_TIME && !form.dialog.isShowing() && now - form.opened > 300) form.dialog.show(); // A script that never said either.
 				}
 				if (forms.isEmpty()) watching = false;
 				else watchdog.postDelayed(this, 200);
@@ -124,7 +127,8 @@ public final class NativeForm {
 			return;
 		}
 		form.alive = android.os.SystemClock.uptimeMillis();
-		if (!form.dialog.isShowing()) form.dialog.show();
+		// Shown once its controls are in it, which is when the script next says it is alive or where focus is: a form filled in while on screen has the screen reader following every control as it arrives.
+		if (!form.dialog.isShowing() && (op.equals("alive") || op.equals("focus"))) form.dialog.show();
 		if (op.equals("alive")) return;
 		if (op.equals("title")) {
 			form.dialog.setTitle(f[2]);
@@ -197,9 +201,8 @@ public final class NativeForm {
 			w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 			w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE | WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN);
 		}
-		form.alive = android.os.SystemClock.uptimeMillis();
+		form.alive = form.opened = android.os.SystemClock.uptimeMillis();
 		forms.put(id, form);
-		form.dialog.show();
 		watch();
 	}
 
@@ -231,6 +234,7 @@ public final class NativeForm {
 		c.label = null;
 		c.widget = null;
 		c.items.clear();
+		c.itemHost = c.row;
 		c.selected = -1;
 		final String fid = String.valueOf(form.id), cid = String.valueOf(index);
 		LinearLayout.LayoutParams wide = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -290,6 +294,13 @@ public final class NativeForm {
 			makeLabel(activity, c, label);
 			if (Build.VERSION.SDK_INT >= 28) c.label.setAccessibilityHeading(true);
 			// The items are added to the row itself by setItems.
+		} else if (type.equals("tabs")) {
+			makeLabel(activity, c, label);
+			android.widget.HorizontalScrollView strip = new android.widget.HorizontalScrollView(activity);
+			c.itemHost = new LinearLayout(activity);
+			c.itemHost.setOrientation(LinearLayout.HORIZONTAL);
+			strip.addView(c.itemHost, new android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+			c.row.addView(strip, wide);
 		} else if (type.equals("slider")) {
 			makeLabel(activity, c, label);
 			SeekBar s = new SeekBar(activity);
@@ -366,7 +377,8 @@ public final class NativeForm {
 	// Items are changed in place where they can be, so that the screen reader's cursor stays on the item it was reading when a list only grows or has a line reworded.
 	private static void setItems(final Activity activity, final Form form, final int index, final Control c, String[] f) {
 		int count = f.length - 4;
-		while (c.items.size() > count) c.row.removeView(c.items.remove(c.items.size() - 1));
+		final boolean tabs = c.type.equals("tabs");
+		while (c.items.size() > count) c.itemHost.removeView(c.items.remove(c.items.size() - 1));
 		for (int i = 0; i < count; i++) {
 			String text = f[4 + i];
 			if (i < c.items.size()) {
@@ -382,37 +394,48 @@ public final class NativeForm {
 			item.setFocusable(true);
 			item.setClickable(true);
 			item.setEnabled((c.flags & FLAG_ENABLED) != 0);
+			if (tabs) item.setPadding(dp(activity, 16), 0, dp(activity, 16), 0);
 			item.setOnClickListener(v -> {
+				boolean changed = c.selected != position;
 				select(c, position);
-				event("activate", String.valueOf(form.id), String.valueOf(index), String.valueOf(position));
+				if (!tabs) event("activate", String.valueOf(form.id), String.valueOf(index), String.valueOf(position));
+				else if (changed) event("select", String.valueOf(form.id), String.valueOf(index), String.valueOf(position));
 			});
-			// Moving the screen reader's cursor on to an item is what arrowing to it is in an audio form.
+			// Moving the screen reader's cursor on to a list item is what arrowing to it is in an audio form. A tab is only chosen by tapping it, as tabs are everywhere else on a phone.
 			item.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+				@Override public void onInitializeAccessibilityNodeInfo(View host, android.view.accessibility.AccessibilityNodeInfo info) {
+					super.onInitializeAccessibilityNodeInfo(host, info);
+					if (tabs) info.getExtras().putCharSequence("AccessibilityNodeInfo.roleDescription", "tab");
+				}
 				@Override public void sendAccessibilityEvent(View host, int type) {
 					super.sendAccessibilityEvent(host, type);
 					if (type != AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED) return;
 					event("focus", String.valueOf(form.id), String.valueOf(index));
-					if (c.selected == position) return;
+					if (tabs || c.selected == position) return;
 					select(c, position);
 					event("select", String.valueOf(form.id), String.valueOf(index), String.valueOf(position));
 				}
 			});
 			c.items.add(item);
-			c.row.addView(item, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+			c.itemHost.addView(item, new LinearLayout.LayoutParams(tabs ? ViewGroup.LayoutParams.WRAP_CONTENT : ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 		}
 		c.selected = -1;
 		select(c, Integer.parseInt(f[3]));
 	}
 
 	private static void select(Control c, int position) {
-		if (c.selected >= 0 && c.selected < c.items.size()) c.items.get(c.selected).setSelected(false);
+		if (c.selected >= 0 && c.selected < c.items.size()) mark(c, c.items.get(c.selected), false);
 		c.selected = position;
-		if (position >= 0 && position < c.items.size()) c.items.get(position).setSelected(true);
+		if (position >= 0 && position < c.items.size()) mark(c, c.items.get(position), true);
+	}
+	private static void mark(Control c, TextView item, boolean selected) {
+		item.setSelected(selected);
+		if (c.type.equals("tabs")) item.setTypeface(null, selected ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL); // So the chosen tab can be seen as well as heard.
 	}
 
 	private static void focus(Control c) {
 		View v = c.widget;
-		if (c.type.equals("list")) v = c.selected >= 0 && c.selected < c.items.size() ? c.items.get(c.selected) : c.items.isEmpty() ? c.label : c.items.get(0);
+		if (c.type.equals("list") || c.type.equals("tabs")) v = c.selected >= 0 && c.selected < c.items.size() ? c.items.get(c.selected) : c.items.isEmpty() ? c.label : c.items.get(0);
 		if (v == null) return;
 		final View target = v;
 		// Posted, because a control that was only just added has not been laid out yet and cannot take the screen reader's cursor until it has.

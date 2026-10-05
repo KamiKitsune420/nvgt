@@ -1,0 +1,53 @@
+Import("env")
+import os
+
+# LOCAL CHANGE (Eleutheria): only Windows has the wxWidgets headers and libraries kept here, so nothing is built anywhere else, an Android build started from Windows included. Without this the Linux and Android stub builds would stop here.
+if env["PLATFORM"] != "win32" or ARGUMENTS.get("target", "") == "android":
+    Return()
+
+plugin_name = "nvgt_wx"
+plugin_env = env.Clone()
+wx_lib_path = os.path.join("lib")
+wx_include = os.path.join("include")
+wx_setup_h = os.path.join(wx_lib_path, "mswu")
+
+if plugin_env["PLATFORM"] == "win32":
+    plugin_env.Append(CPPPATH=[wx_include, wx_setup_h])
+    plugin_env.Append(LIBPATH=[wx_lib_path])
+
+    plugin_env.Append(LIBS=[
+        "wxmsw33u_core",
+        "wxbase33u"
+    ])
+
+    plugin_env.Append(CPPDEFINES=[
+        "UNICODE", "_UNICODE",
+        "WXUSINGDLL",
+        "__WXMSW__"
+    ])
+
+# CScriptArray (the AngelScript `array<T>` add-on) is consumed from NVGT's
+# ASAddon tree the same way the redis plugin does: we compile NVGT's
+# `ASAddon/plugin/scriptarray.cpp` wrapper (which `#define`s
+# `NVGT_PLUGIN_INCLUDE` and pulls in `ASAddon/src/scriptarray.cpp`)
+# straight into nvgt_wx.dll. NVGT's main SConstruct already adds
+# `#ASAddon/include` to CPPPATH so `<scriptarray.h>` resolves for the
+# rest of the bridge. See AGENTS.md "scriptarray (consumed from ASAddon)".
+scriptarray = plugin_env.SharedObject(
+    "scriptarray",
+    "#ASAddon/plugin/scriptarray.cpp",
+)
+
+shared_lib = plugin_env.SharedLibrary(
+    target="#release/lib/" + plugin_name,
+    source=[
+        "wx.cpp",
+        "src/runtime.cpp",
+        "src/helpers.cpp",
+        "src/manager.cpp",
+        "src/register.cpp",
+        scriptarray,
+    ]
+)
+
+Return("shared_lib")

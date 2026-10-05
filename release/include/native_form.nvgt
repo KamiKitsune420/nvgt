@@ -9,7 +9,7 @@
  *
  * The controls themselves are made by a backend that takes messages and gives back events, both lists of fields separated by character 31:
  *	open id title, close id, alive id, title id title, count id controls
- *	control id index type flags label, where type is button, input, checkbox, list, slider, progress, text or none, and flags add up 1 enabled, 2 visible, 4 read only, 8 multiline, 16 password
+ *	control id index type flags label, where type is button, input, checkbox, list, tabs (a list shown as a row of tabs, for a tab panel), slider, progress, text or none, and flags add up 1 enabled, 2 visible, 4 read only, 8 multiline, 16 password
  *	label id index label, state id index flags, text id index text, check id index 0/1, items id index position item..., select id index position, range id index minimum maximum step value, progress id index percent, focus id index
  * and back: click id index, check id index 0/1, text id index text, select id index position, activate id index position, value id index value, submit id index, focus id index, cancel id.
  * The engine's is native_ui_send and native_ui_receive. A script can supply another by setting native_form_custom_backend.
@@ -281,7 +281,7 @@ class native_form : audio_form {
 			case ct_button: case ct_link: return "button";
 			case ct_input: return "input";
 			case ct_checkbox: return "checkbox";
-			case ct_list: return "list";
+			case ct_list: return c.list_is_tab_panel ? "tabs" : "list";
 			case ct_slider: return "slider";
 			case ct_progress: return "progress";
 			case ct_status_bar: return "text";
