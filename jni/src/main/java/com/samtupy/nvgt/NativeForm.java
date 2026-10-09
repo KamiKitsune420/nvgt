@@ -25,6 +25,7 @@ import android.widget.TextView;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
@@ -56,12 +57,21 @@ public final class NativeForm {
 		Dialog dialog;
 		LinearLayout column;
 		ArrayList<Control> controls = new ArrayList<>();
-		long alive; // When the script last said anything about this form.
 		long opened;
+		boolean backDown; // The back button went down on this form, so its coming up is a press of it.
+		boolean hidden; // Taken off the screen for want of a word from the script, and not put back yet.
 	}
+	// When the script last said anything about each form. Noted as the message is sent, on the script's own thread, not when the UI thread gets round to it: a UI thread held up for a moment, as it is while the on-screen keyboard slides in, is not a script that has gone away, and taking the form off the screen for it shuts the keyboard on whoever is typing.
+	private static final ConcurrentHashMap<Integer, Long> heard = new ConcurrentHashMap<>();
 
 	// A script has no way to say that a form is finished with: it just stops looking at it. So a form that has not been heard from for a while is taken off the screen, and comes back if the script returns to it.
-	private static final long ALIVE_TIME = 700;
+	private static final long ALIVE_TIME = 1000;
+	private static void show(Form form) {
+		form.dialog.show();
+		if (!form.hidden) return;
+		form.hidden = false;
+		event("shown", String.valueOf(form.id)); // The screen reader's cursor went with it, so the script says again where focus is.
+	}
 	private static final android.os.Handler watchdog = new android.os.Handler(android.os.Looper.getMainLooper());
 	private static boolean watching = false;
 	private static void watch() {
@@ -71,8 +81,13 @@ public final class NativeForm {
 			@Override public void run() {
 				long now = android.os.SystemClock.uptimeMillis();
 				for (Form form : forms.values()) {
-					if (now - form.alive > ALIVE_TIME && form.dialog.isShowing()) form.dialog.hide();
-					else if (now - form.alive <= ALIVE_TIME && !form.dialog.isShowing() && now - form.opened > 300) form.dialog.show(); // A script that never said either.
+					Long last = heard.get(form.id);
+					long quiet = now - (last != null ? last : form.opened);
+					if (quiet > ALIVE_TIME && form.dialog.isShowing()) {
+						form.hidden = true;
+						android.util.Log.i("NativeForm", "form " + form.id + " taken off the screen, nothing heard for " + quiet + " ms");
+						form.dialog.hide();
+					} else if (quiet <= ALIVE_TIME && !form.dialog.isShowing() && now - form.opened > 300) show(form); // A script that never said either.
 				}
 				if (forms.isEmpty()) watching = false;
 				else watchdog.postDelayed(this, 200);
@@ -94,6 +109,11 @@ public final class NativeForm {
 		if (activity == null || message == null) return false;
 		final String[] f = new String(message, StandardCharsets.UTF_8).split(SEP, -1);
 		if (f.length < 2) return false;
+		try {
+			heard.put(Integer.parseInt(f[1]), android.os.SystemClock.uptimeMillis());
+		} catch (NumberFormatException e) {
+			return false;
+		}
 		activity.runOnUiThread(() -> {
 			try {
 				handle(activity, f);
@@ -123,12 +143,12 @@ public final class NativeForm {
 		if (form == null) return;
 		if (op.equals("close")) {
 			forms.remove(id);
+			heard.remove(id);
 			form.dialog.dismiss();
 			return;
 		}
-		form.alive = android.os.SystemClock.uptimeMillis();
 		// Shown once its controls are in it, which is when the script next says it is alive or where focus is: a form filled in while on screen has the screen reader following every control as it arrives.
-		if (!form.dialog.isShowing() && (op.equals("alive") || op.equals("focus"))) form.dialog.show();
+		if (!form.dialog.isShowing() && (op.equals("alive") || op.equals("focus"))) show(form);
 		if (op.equals("alive")) return;
 		if (op.equals("title")) {
 			form.dialog.setTitle(f[2]);
@@ -184,7 +204,12 @@ public final class NativeForm {
 		form.dialog.setCancelable(false);
 		form.dialog.setOnKeyListener((d, keyCode, e) -> {
 			if (keyCode != KeyEvent.KEYCODE_BACK && keyCode != KeyEvent.KEYCODE_ESCAPE) return false;
-			if (e.getAction() == KeyEvent.ACTION_UP) event("cancel", String.valueOf(id));
+			// Only a press that began here is a cancel. With the on-screen keyboard up, back puts the keyboard away and the dialog is handed just the release, which used to cancel the form as well.
+			if (e.getAction() == KeyEvent.ACTION_DOWN) form.backDown = true;
+			else if (e.getAction() == KeyEvent.ACTION_UP && form.backDown) {
+				form.backDown = false;
+				if (!e.isCanceled()) event("cancel", String.valueOf(id));
+			}
 			return true;
 		});
 		ScrollView scroller = new ScrollView(activity);
@@ -201,7 +226,7 @@ public final class NativeForm {
 			w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 			w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE | WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN);
 		}
-		form.alive = form.opened = android.os.SystemClock.uptimeMillis();
+		form.opened = android.os.SystemClock.uptimeMillis();
 		forms.put(id, form);
 		watch();
 	}

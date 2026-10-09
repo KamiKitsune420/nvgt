@@ -11,7 +11,7 @@
  *	open id title, close id, alive id, title id title, count id controls
  *	control id index type flags label, where type is button, input, checkbox, list, tabs (a list shown as a row of tabs, for a tab panel), slider, progress, text or none, and flags add up 1 enabled, 2 visible, 4 read only, 8 multiline, 16 password
  *	label id index label, state id index flags, text id index text, check id index 0/1, items id index position item..., select id index position, range id index minimum maximum step value, progress id index percent, focus id index
- * and back: click id index, check id index 0/1, text id index text, select id index position, activate id index position, value id index value, submit id index, focus id index, cancel id.
+ * and back: click id index, check id index 0/1, text id index text, select id index position, activate id index position, value id index value, submit id index, focus id index, cancel id, shown id (the form is back on screen after being taken off).
  * The engine's is native_ui_send and native_ui_receive. A script can supply another by setting native_form_custom_backend.
  *
  * NVGT - NonVisual Gaming Toolkit
@@ -91,7 +91,6 @@ class native_form : audio_form {
 	protected int native_focus;
 	protected uint64 native_sync_time;
 	protected uint64 native_alive_time;
-	protected uint64 native_monitor_time;
 	protected bool native_opened; // A form goes on screen when it is first monitored, since many are built long before they are used.
 	protected string native_title;
 	~native_form() {
@@ -159,12 +158,7 @@ class native_form : audio_form {
 			native_opened = true;
 			native_alive_time = now;
 			native_form_send("open" + NATIVE_FORM_SEPARATOR + native_id + NATIVE_FORM_SEPARATOR + native_title);
-		} else if (now - native_monitor_time > 600) {
-			// The form was left alone for long enough to have been taken off the screen. It is back now, and has to be told again where focus is.
-			native_focus = -1;
-			native_sync_time = 0;
 		}
-		native_monitor_time = now;
 		if (now - native_alive_time >= 150) {
 			native_alive_time = now;
 			native_form_send("alive" + NATIVE_FORM_SEPARATOR + native_id);
@@ -302,6 +296,12 @@ class native_form : audio_form {
 	protected void native_event(string[]@ f) {
 		if (f[0] == "cancel") {
 			native_press(KEY_ESCAPE);
+			return;
+		}
+		if (f[0] == "shown") {
+			// The form had been taken off the screen and is back, so it has to be told again where focus is. Only then: said after any pause of the script's, it took the screen reader's cursor off the on-screen keyboard and back to the box being typed in.
+			native_focus = -1;
+			native_sync_time = 0;
 			return;
 		}
 		if (f.length() < 3) return;
