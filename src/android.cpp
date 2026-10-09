@@ -691,4 +691,53 @@ std::string native_ui_receive() {
 	return result;
 }
 
+// Handing an APK to the system's package installer, through com.samtupy.nvgt.Installer: how an app that is not from a store updates itself. The system asks the user before installing anything, and the app's manifest needs REQUEST_INSTALL_PACKAGES.
+static jclass InstallerClass = nullptr;
+static jmethodID android_installer_method(JNIEnv*& env, const char* name, const char* signature) {
+	env = (JNIEnv*)SDL_GetAndroidJNIEnv();
+	if (!env) return nullptr;
+	if (!InstallerClass) {
+		LocalRef<jclass> cls(env, env->FindClass("com/samtupy/nvgt/Installer"));
+		if (!cls.get()) {
+			env->ExceptionClear();
+			return nullptr;
+		}
+		InstallerClass = (jclass)env->NewGlobalRef(cls.get());
+		if (!InstallerClass) return nullptr;
+	}
+	jmethodID mid = env->GetStaticMethodID(InstallerClass, name, signature);
+	if (!mid) env->ExceptionClear();
+	return mid;
+}
+// Starts it and returns at once: false if the file can't be read or one is already being handed over. android_install_package_status says how it is going.
+bool android_install_package(const std::string& path) {
+	JNIEnv* env;
+	jmethodID mid = android_installer_method(env, "install", "(Landroid/app/Activity;Ljava/lang/String;)Z");
+	if (!mid) return false;
+	LocalRef<jobject> activity(env, (jobject)SDL_GetAndroidActivity());
+	LocalRef<jstring> jpath(env, env->NewStringUTF(path.c_str()));
+	bool result = env->CallStaticBooleanMethod(InstallerClass, mid, activity.get(), jpath.get());
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	return result;
+}
+// "" when nothing is going on, "preparing" while the file is copied to the installer, "asking" once the user has been asked, "cancelled" if they said no, or "failed: " and why. An update that goes on closes the app, so success is never seen.
+std::string android_install_package_status() {
+	JNIEnv* env;
+	jmethodID mid = android_installer_method(env, "getStatus", "()Ljava/lang/String;");
+	if (!mid) return "";
+	LocalRef<jstring> jresult(env, (jstring)env->CallStaticObjectMethod(InstallerClass, mid));
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return "";
+	}
+	if (!jresult.get()) return "";
+	const char* utf = env->GetStringUTFChars(jresult.get(), nullptr);
+	std::string result = utf ? utf : "";
+	if (utf) env->ReleaseStringUTFChars(jresult.get(), utf);
+	return result;
+}
+
 #endif // __ANDROID__

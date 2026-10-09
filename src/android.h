@@ -40,6 +40,8 @@ bool android_cancel_vibration();
 bool native_ui_available();
 bool native_ui_send(const std::string& message);
 std::string native_ui_receive();
+bool android_install_package(const std::string& path);
+std::string android_install_package_status();
 
 // JNI Helpers
 class JNIException : public std::runtime_error {

@@ -200,6 +200,8 @@ bool android_cancel_vibration() { return false; }
 bool native_ui_available() { return false; }
 bool native_ui_send(const std::string& message) { return false; }
 std::string native_ui_receive() { return ""; }
+bool android_install_package(const std::string& path) { return false; }
+std::string android_install_package_status() { return ""; }
 std::string get_directory_appdata() {
 	return Path::configHome();
 }
@@ -262,6 +264,8 @@ bool android_cancel_vibration(); // android.cpp
 bool native_ui_available(); // android.cpp
 bool native_ui_send(const std::string& message); // android.cpp
 std::string native_ui_receive(); // android.cpp
+bool android_install_package(const std::string& path); // android.cpp
+std::string android_install_package_status(); // android.cpp
 bool show_android_toast(const std::string& message, int duration, int gravity, int x_offset, int y_offset) {
 	return SDL_ShowAndroidToast(message.c_str(), duration, gravity, x_offset, y_offset);
 }
@@ -306,6 +310,8 @@ void RegisterXplatform(asIScriptEngine* engine) {
 	engine->RegisterGlobalFunction("bool native_ui_available()", asFUNCTION(native_ui_available), asCALL_CDECL);
 	engine->RegisterGlobalFunction("bool native_ui_send(const string&in message)", asFUNCTION(native_ui_send), asCALL_CDECL);
 	engine->RegisterGlobalFunction("string native_ui_receive()", asFUNCTION(native_ui_receive), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool android_install_package(const string&in path)", asFUNCTION(android_install_package), asCALL_CDECL);
+	engine->RegisterGlobalFunction("string android_install_package_status()", asFUNCTION(android_install_package_status), asCALL_CDECL);
 	engine->SetDefaultAccessMask(NVGT_SUBSYSTEM_GENERAL);
 	engine->RegisterGlobalFunction("int get_ANDROID_SDK_VERSION() property", asFUNCTION(SDL_GetAndroidSDKVersion), asCALL_CDECL);
 	engine->RegisterGlobalFunction("bool get_system_is_chromebook() property", asFUNCTION(SDL_IsChromebook), asCALL_CDECL);
