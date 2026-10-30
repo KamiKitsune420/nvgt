@@ -1326,12 +1326,22 @@ class sound_environment_impl : public sound_environment {
 	bool running = true;
 	bool scene_dirty = false;
 	bool sim_dirty = true;
-	bool wake_requested = false;
+	// LOCAL CHANGE (Eleutheria): atomic, so a thread that could not take the lock can still ask
+	// for a pass (see prime_source) without racing the worker over it.
+	std::atomic<bool> wake_requested {false};
 	float occlusion_radius = 0.5f;
 	int occlusion_samples = 16;
 	int transmission_rays = 3;
 	int update_rate = 20;
 	static const int max_occlusion_samples = 64;
+
+	// LOCAL CHANGE (Eleutheria): tiles, the unit results are kept and compared in (see cache_key
+	// and prime_source). Whole numbers, so a sound that moved a hair is on the same tile.
+	static bool same_tile(float a, float b) { return int(floorf(a)) == int(floorf(b)); }
+	static bool next_door(float a, float b) {
+		int d = int(floorf(a)) - int(floorf(b));
+		return d >= -1 && d <= 1;
+	}
 
 	static uint64_t cache_key(float sx, float sy, float sz, float lx, float ly, float lz) {
 		int v[6] = {int(floorf(sx)), int(floorf(sy)), int(floorf(sz)), int(floorf(lx)), int(floorf(ly)), int(floorf(lz))};
@@ -1812,18 +1822,45 @@ public:
 		share = route_share(r.occlusion, r.transmission[1], r.via_amount * r.via_eq[1]);
 		return true;
 	}
+	// LOCAL CHANGE (Eleutheria): this used to take the lock and then wait up to 20 ms for a pass
+	// to publish. The worker holds the lock for a whole pass, which is one simulation from the
+	// listener and another from every doorway in sight, so starting a sound cost the calling
+	// thread about 40 milliseconds. That thread is a game's main loop: in a village with a
+	// couple of animals in it, a handful of sounds a second each stopped the loop for longer
+	// than the time between two footsteps, and steps the player had pressed for came up to half
+	// a second late or never. Nothing here waits for the worker any more. A sound starts with
+	// the result for its own tile, or failing that a neighbouring one, and the next pass puts
+	// the exact one in; apply_environment eases towards whatever it is given, so the correction
+	// cannot click. A tile with no neighbour known yet gets a couple of milliseconds' grace, in
+	// case the worker is idle and can answer at once, and then starts without it.
 	void prime_source(sound_environment_source* s, float sx, float sy, float sz, float lx, float ly, float lz) override {
 		if (!s) return;
-		std::unique_lock<std::mutex> lock(m);
+		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			// The worker is mid pass, and a pass takes longer than a sound can be kept waiting.
+			// What the source already has is kept if it was found for a tile touching this one,
+			// since a tile over is through the same walls: that is the usual case for a footstep
+			// after a footstep, and it keeps the start of the sound. A result from further off
+			// would be a sound judged from somewhere it is not, which is worse than a quiet
+			// first block, so it goes and the audio thread fills one in when it comes to play
+			// the block (try_prefill), or the next pass does.
+			bool nearby = s->has_results.load(std::memory_order_acquire) && next_door(s->sx.load(), sx) && next_door(s->sy.load(), sy) && same_tile(s->sz.load(), sz) && next_door(s->lx.load(), lx) && next_door(s->ly.load(), ly) && same_tile(s->lz.load(), lz);
+			sound_environment_source_set_positions(s, sx, sy, sz, lx, ly, lz);
+			if (!nearby) s->has_results.store(false, std::memory_order_release);
+			wake_requested = true;
+			wake.notify_all();
+			return;
+		}
 		// Already simulated where it is, as a sound played again without moving is: nothing to do, and no gap in what is playing.
 		if (s->has_results.load() && s->sx.load() == sx && s->sy.load() == sy && s->sz.load() == sz && s->lx.load() == lx && s->ly.load() == ly && s->lz.load() == lz) return;
 		sound_environment_source_set_positions(s, sx, sy, sz, lx, ly, lz);
 		// Whatever it has was found for somewhere else: while a file loads, a sound may already have been simulated at the origin.
 		s->has_results.store(false, std::memory_order_release);
-		if (fill_from_cache(s)) return;
+		bool filled = fill_from_cache(s) || fill_from_nearby(s);
 		wake_requested = true;
 		wake.notify_all();
-		published.wait_for(lock, std::chrono::milliseconds(20), [s] { return s->has_results.load(std::memory_order_acquire); });
+		if (!filled)
+			published.wait_for(lock, std::chrono::milliseconds(2), [s] { return s->has_results.load(std::memory_order_acquire); });
 	}
 	// Gives a new source the result simulated at the same spot recently, if there is one. Audio thread: never waits.
 	bool try_prefill(sound_environment_source* s) {
@@ -1835,7 +1872,32 @@ public:
 	bool fill_from_cache(sound_environment_source* s) {
 		auto it = cache.find(cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load()));
 		if (it == cache.end()) return false;
-		const cached_result& r = it->second;
+		apply_cached(s, it->second);
+		return true;
+	}
+	// LOCAL CHANGE (Eleutheria): the result for a tile next to this one, for a sound that cannot
+	// wait for its own (see prime_source). A tile over is through the same walls and round the
+	// same doorway, which is near enough to start a sound with; the exact result follows at the
+	// next pass. Both ways round, because either end moves: the listener walking past a fire
+	// that stays put, or an animal hopping about while the listener stands still.
+	// With the lock held.
+	bool fill_from_nearby(sound_environment_source* s) {
+		float sx = s->sx.load(), sy = s->sy.load(), sz = s->sz.load();
+		float lx = s->lx.load(), ly = s->ly.load(), lz = s->lz.load();
+		for (int dx = -1; dx <= 1; dx++) {
+			for (int dy = -1; dy <= 1; dy++) {
+				if (dx == 0 && dy == 0) continue;
+				auto it = cache.find(cache_key(sx, sy, sz, lx + dx, ly + dy, lz));
+				if (it == cache.end()) it = cache.find(cache_key(sx + dx, sy + dy, sz, lx, ly, lz));
+				if (it == cache.end()) continue;
+				apply_cached(s, it->second);
+				return true;
+			}
+		}
+		return false;
+	}
+	// With the lock held.
+	void apply_cached(sound_environment_source* s, const cached_result& r) {
 		s->occlusion.store(r.occlusion);
 		for (int i = 0; i < 3; i++) s->transmission[i].store(r.transmission[i]);
 		if (r.via_amount > 0) {
@@ -1849,7 +1911,6 @@ public:
 		for (int i = 0; i < 3; i++) s->route_mix[i].store(r.via_amount * r.via_eq[i], std::memory_order_release);
 		s->via_active.store(r.via_active, std::memory_order_release);
 		s->has_results.store(true, std::memory_order_release);
-		return true;
 	}
 };
 sound_environment* sound_environment::create() { return new sound_environment_impl(); }
