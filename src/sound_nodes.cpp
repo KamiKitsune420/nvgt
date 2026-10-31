@@ -1319,6 +1319,16 @@ class sound_environment_impl : public sound_environment {
 	std::vector<std::unique_ptr<sound_environment_source>> sources;
 	// Recent results by (sound tile, listener tile), so a new sound where one just played (another footstep) starts with the right occlusion.
 	std::unordered_map<uint64_t, cached_result> cache;
+	// LOCAL CHANGE (Eleutheria): the cache has a lock of its own, so a sound starting while the
+	// worker is mid pass can still be given the result found at its spot a moment ago. Anything
+	// wanting both takes m first and cache_m second, and nothing takes m while holding cache_m.
+	mutable std::mutex cache_m;
+	// LOCAL CHANGE (Eleutheria): sources made before anybody asks for one, so starting a sound
+	// never waits for a pass to end (see create_source). They sit in sources with no position,
+	// which costs a pass nothing, and the worker tops the list up.
+	std::vector<sound_environment_source*> spares;
+	mutable std::mutex spare_m;
+	static const size_t spare_sources = 8;
 	mutable std::mutex m;
 	std::condition_variable wake;
 	std::condition_variable published; // A pass has given its results to the sources (see prime_source).
@@ -1334,6 +1344,9 @@ class sound_environment_impl : public sound_environment {
 	int transmission_rays = 3;
 	int update_rate = 20;
 	static const int max_occlusion_samples = 64;
+	// LOCAL CHANGE (Eleutheria): how far from the listener a doorway is still worth simulating
+	// from, in the same units as everything else here. See the portal loop in run().
+	static constexpr float portal_reach = 32.0f;
 
 	// LOCAL CHANGE (Eleutheria): tiles, the unit results are kept and compared in (see cache_key
 	// and prime_source). Whole numbers, so a sound that moved a hair is on the same tile.
@@ -1415,7 +1428,28 @@ class sound_environment_impl : public sound_environment {
 				iplSceneCommit(scene);
 				scene_dirty = false;
 				sim_dirty = true;
-				cache.clear(); // Walls changed (a door opened), so old results are wrong.
+				{
+					std::lock_guard<std::mutex> cl(cache_m);
+					cache.clear(); // Walls changed (a door opened), so old results are wrong.
+				}
+			}
+			// LOCAL CHANGE (Eleutheria): spare sources, made here where making one is free because
+			// the worker holds the lock anyway. Before the loop below, so a spare handed out now
+			// is added to the simulator by this pass and answers from the moment it is given away.
+			while (true) {
+				size_t have;
+				{
+					std::lock_guard<std::mutex> sl(spare_m);
+					have = spares.size();
+				}
+				if (have >= spare_sources) break;
+				auto spare = std::make_unique<sound_environment_source>();
+				IPLSourceSettings spare_settings {IPL_SIMULATIONFLAGS_DIRECT};
+				if (iplSourceCreate(sim, &spare_settings, &spare->source) != IPL_STATUS_SUCCESS) break;
+				sound_environment_source* kept = spare.get();
+				sources.push_back(std::move(spare));
+				std::lock_guard<std::mutex> sl(spare_m);
+				spares.push_back(kept);
 			}
 			for (auto it = sources.begin(); it != sources.end();) {
 				sound_environment_source* s = it->get();
@@ -1492,6 +1526,12 @@ class sound_environment_impl : public sound_environment {
 					for (portal& p : portals) {
 						// Even a doorway you can barely see is tried, so its sound fades in as it comes into view (its share is tiny at first).
 						if (!p.added || p.visibility < 0.02f) continue;
+						// LOCAL CHANGE (Eleutheria): a doorway far behind the player is not a way
+						// round to anything still audible, and trying it costs a simulation from
+						// there over every source. portal_reach is comfortably past the distance a
+						// footstep carries, so nothing that could be heard loses its route.
+						float pdx = p.x - listener.x, pdy = p.y - listener.y, pdz = p.z - listener.z;
+						if (pdx * pdx + pdy * pdy + pdz * pdz > portal_reach * portal_reach) continue;
 						run_from(p.x, p.y, p.z);
 						for (size_t i = 0; i < sources.size(); i++) {
 							sound_environment_source* src = sources[i].get();
@@ -1549,8 +1589,11 @@ class sound_environment_impl : public sound_environment {
 					for (int b = 0; b < 3; b++) src->route_mix[b].store(r.via_amount * r.via_eq[b], std::memory_order_release);
 					src->via_active.store(r.via_active, std::memory_order_release);
 					src->has_results.store(true, std::memory_order_release);
-					if (cache.size() > 4096) cache.clear();
-					cache[cache_key(src->sx.load(), src->sy.load(), src->sz.load(), src->lx.load(), src->ly.load(), src->lz.load())] = r;
+					{
+						std::lock_guard<std::mutex> cl(cache_m);
+						if (cache.size() > 4096) cache.clear();
+						cache[cache_key(src->sx.load(), src->sy.load(), src->sz.load(), src->lx.load(), src->ly.load(), src->lz.load())] = r;
+					}
 				}
 				published.notify_all();
 			}
@@ -1607,6 +1650,7 @@ public:
 			iplSourceRelease(&s->source);
 		}
 		sources.clear();
+		spares.clear(); // LOCAL CHANGE (Eleutheria): the same sources, released just above.
 		for (portal& p : portals) {
 			if (!p.source) continue;
 			if (p.added) iplSourceRemove(p.source, sim);
@@ -1789,6 +1833,22 @@ public:
 		return muffle_frequency.load();
 	}
 	sound_environment_source* create_source(bool wait) override {
+		// LOCAL CHANGE (Eleutheria): a ready-made source first. Making one needs the worker's
+		// lock, which it holds for a whole pass: one simulation from the listener and another
+		// from every doorway in sight, which is longer than the gap between two passes. A game's
+		// main loop asks for a source every time it starts a sound somewhere, so it was waiting
+		// about a tenth of a second at a time, and that is what made walking drag. Taking one
+		// off this list touches nothing the worker uses.
+		{
+			std::lock_guard<std::mutex> sl(spare_m);
+			if (!spares.empty()) {
+				sound_environment_source* ready = spares.back();
+				spares.pop_back();
+				wake_requested = true; // Make another, and simulate this one.
+				wake.notify_all();
+				return ready;
+			}
+		}
 		// From the audio thread: never wait for the worker.
 		std::unique_lock<std::mutex> lock(m, std::defer_lock);
 		if (wait) lock.lock();
@@ -1810,8 +1870,8 @@ public:
 	bool get_portal_blend_at(float sx, float sy, float sz, float& x, float& y, float& z, float& distance, float& share) override {
 		float lx, ly, lz;
 		if (!get_listener(lx, ly, lz)) return false;
-		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
-		if (!lock.owns_lock()) return false;
+		std::unique_lock<std::mutex> cl(cache_m, std::try_to_lock);
+		if (!cl.owns_lock()) return false;
 		auto it = cache.find(cache_key(sx, sy, sz, lx, ly, lz));
 		if (it == cache.end() || it->second.via_amount <= 0) return false;
 		const cached_result& r = it->second;
@@ -1846,7 +1906,10 @@ public:
 			// the block (try_prefill), or the next pass does.
 			bool nearby = s->has_results.load(std::memory_order_acquire) && next_door(s->sx.load(), sx) && next_door(s->sy.load(), sy) && same_tile(s->sz.load(), sz) && next_door(s->lx.load(), lx) && next_door(s->ly.load(), ly) && same_tile(s->lz.load(), lz);
 			sound_environment_source_set_positions(s, sx, sy, sz, lx, ly, lz);
-			if (!nearby) s->has_results.store(false, std::memory_order_release);
+			// The cache is behind its own lock, so the result found at this spot a moment ago is
+			// still to be had while the worker is busy. Failing that the audio thread tries again
+			// when it comes to play the block (try_prefill), or the next pass puts it in.
+			if (!nearby && !fill_from_cache(s)) s->has_results.store(false, std::memory_order_release);
 			wake_requested = true;
 			wake.notify_all();
 			return;
@@ -1864,12 +1927,17 @@ public:
 	}
 	// Gives a new source the result simulated at the same spot recently, if there is one. Audio thread: never waits.
 	bool try_prefill(sound_environment_source* s) {
-		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
-		if (!lock.owns_lock()) return false;
-		return fill_from_cache(s);
+		std::unique_lock<std::mutex> cl(cache_m, std::try_to_lock);
+		return cl.owns_lock() && fill_from_cache_locked(s);
 	}
-	// With the lock held.
+	// LOCAL CHANGE (Eleutheria): cache_m, not m, so reading a recent result no longer waits for
+	// the pass the worker is in the middle of.
 	bool fill_from_cache(sound_environment_source* s) {
+		std::lock_guard<std::mutex> cl(cache_m);
+		return fill_from_cache_locked(s);
+	}
+	// With cache_m held.
+	bool fill_from_cache_locked(sound_environment_source* s) {
 		auto it = cache.find(cache_key(s->sx.load(), s->sy.load(), s->sz.load(), s->lx.load(), s->ly.load(), s->lz.load()));
 		if (it == cache.end()) return false;
 		apply_cached(s, it->second);
@@ -1880,8 +1948,8 @@ public:
 	// same doorway, which is near enough to start a sound with; the exact result follows at the
 	// next pass. Both ways round, because either end moves: the listener walking past a fire
 	// that stays put, or an animal hopping about while the listener stands still.
-	// With the lock held.
 	bool fill_from_nearby(sound_environment_source* s) {
+		std::lock_guard<std::mutex> cl(cache_m);
 		float sx = s->sx.load(), sy = s->sy.load(), sz = s->sz.load();
 		float lx = s->lx.load(), ly = s->ly.load(), lz = s->lz.load();
 		for (int dx = -1; dx <= 1; dx++) {
@@ -1896,7 +1964,7 @@ public:
 		}
 		return false;
 	}
-	// With the lock held.
+	// With cache_m held.
 	void apply_cached(sound_environment_source* s, const cached_result& r) {
 		s->occlusion.store(r.occlusion);
 		for (int i = 0; i < 3; i++) s->transmission[i].store(r.transmission[i]);
