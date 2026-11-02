@@ -1323,12 +1323,11 @@ class sound_environment_impl : public sound_environment {
 	// worker is mid pass can still be given the result found at its spot a moment ago. Anything
 	// wanting both takes m first and cache_m second, and nothing takes m while holding cache_m.
 	mutable std::mutex cache_m;
-	// LOCAL CHANGE (Eleutheria): sources made before anybody asks for one, so starting a sound
-	// never waits for a pass to end (see create_source). They sit in sources with no position,
-	// which costs a pass nothing, and the worker tops the list up.
-	std::vector<sound_environment_source*> spares;
-	mutable std::mutex spare_m;
-	static const size_t spare_sources = 8;
+	// LOCAL CHANGE (Eleutheria): sources that have been asked for and not made yet, behind a lock
+	// of their own, so asking for one never waits for a pass (see create_source). The worker takes
+	// the whole list at the top of its next pass, where making a source is free.
+	std::vector<std::unique_ptr<sound_environment_source>> pending;
+	mutable std::mutex pending_m;
 	mutable std::mutex m;
 	std::condition_variable wake;
 	std::condition_variable published; // A pass has given its results to the sources (see prime_source).
@@ -1433,28 +1432,24 @@ class sound_environment_impl : public sound_environment {
 					cache.clear(); // Walls changed (a door opened), so old results are wrong.
 				}
 			}
-			// LOCAL CHANGE (Eleutheria): spare sources, made here where making one is free because
-			// the worker holds the lock anyway. Before the loop below, so a spare handed out now
-			// is added to the simulator by this pass and answers from the moment it is given away.
-			while (true) {
-				size_t have;
-				{
-					std::lock_guard<std::mutex> sl(spare_m);
-					have = spares.size();
-				}
-				if (have >= spare_sources) break;
-				auto spare = std::make_unique<sound_environment_source>();
-				IPLSourceSettings spare_settings {IPL_SIMULATIONFLAGS_DIRECT};
-				if (iplSourceCreate(sim, &spare_settings, &spare->source) != IPL_STATUS_SUCCESS) break;
-				sound_environment_source* kept = spare.get();
-				sources.push_back(std::move(spare));
-				std::lock_guard<std::mutex> sl(spare_m);
-				spares.push_back(kept);
+			// LOCAL CHANGE (Eleutheria): the sounds that asked for a source since the last pass.
+			// They are taken on here, where making one is free because the lock is held anyway,
+			// and before the loop below, so this pass adds them to the simulator and simulates
+			// them. Whoever asked has had its answer since the moment it asked.
+			{
+				std::lock_guard<std::mutex> pl(pending_m);
+				for (auto& waiting : pending) sources.push_back(std::move(waiting));
+				pending.clear();
 			}
 			for (auto it = sources.begin(); it != sources.end();) {
 				sound_environment_source* s = it->get();
 				if (s->active.load()) {
-					if (!s->added) {
+					// LOCAL CHANGE (Eleutheria): a source asked for and not made yet is made here.
+					if (!s->source) {
+						IPLSourceSettings settings {IPL_SIMULATIONFLAGS_DIRECT};
+						if (iplSourceCreate(sim, &settings, &s->source) != IPL_STATUS_SUCCESS) s->source = nullptr;
+					}
+					if (s->source && !s->added) {
 						iplSourceAdd(s->source, sim);
 						s->added = true;
 						sim_dirty = true;
@@ -1463,7 +1458,7 @@ class sound_environment_impl : public sound_environment {
 					continue;
 				}
 				if (s->added) iplSourceRemove(s->source, sim);
-				iplSourceRelease(&s->source);
+				if (s->source) iplSourceRelease(&s->source);
 				it = sources.erase(it);
 				sim_dirty = true;
 			}
@@ -1645,12 +1640,14 @@ public:
 		}
 		wake.notify_all();
 		if (worker.joinable()) worker.join();
+		// LOCAL CHANGE (Eleutheria): sources asked for that no pass ever got to (see create_source).
+		for (auto& waiting : pending) sources.push_back(std::move(waiting));
+		pending.clear();
 		for (auto& s : sources) {
 			if (s->added) iplSourceRemove(s->source, sim);
-			iplSourceRelease(&s->source);
+			if (s->source) iplSourceRelease(&s->source);
 		}
 		sources.clear();
-		spares.clear(); // LOCAL CHANGE (Eleutheria): the same sources, released just above.
 		for (portal& p : portals) {
 			if (!p.source) continue;
 			if (p.added) iplSourceRemove(p.source, sim);
@@ -1832,33 +1829,27 @@ public:
 	float get_muffle_frequency() const override {
 		return muffle_frequency.load();
 	}
+	// wait is no longer read: nothing here can block, so there is nothing to decide. It stays for
+	// the sake of every caller already written against it.
 	sound_environment_source* create_source(bool wait) override {
-		// LOCAL CHANGE (Eleutheria): a ready-made source first. Making one needs the worker's
-		// lock, which it holds for a whole pass: one simulation from the listener and another
-		// from every doorway in sight, which is longer than the gap between two passes. A game's
-		// main loop asks for a source every time it starts a sound somewhere, so it was waiting
-		// about a tenth of a second at a time, and that is what made walking drag. Taking one
-		// off this list touches nothing the worker uses.
-		{
-			std::lock_guard<std::mutex> sl(spare_m);
-			if (!spares.empty()) {
-				sound_environment_source* ready = spares.back();
-				spares.pop_back();
-				wake_requested = true; // Make another, and simulate this one.
-				wake.notify_all();
-				return ready;
-			}
-		}
-		// From the audio thread: never wait for the worker.
-		std::unique_lock<std::mutex> lock(m, std::defer_lock);
-		if (wait) lock.lock();
-		else if (!lock.try_lock()) return nullptr;
+		// LOCAL CHANGE (Eleutheria): this touches no Steam Audio, and so does not take the
+		// worker's lock, and so cannot wait. Making a source needs that lock, and the worker holds
+		// it for a whole pass: one simulation from the listener and another from every doorway in
+		// sight. A game's main loop asks for a source every time it starts a sound, and a player
+		// walking into a village starts one for every stream, fire and animal on the map in a
+		// single breath. Fifty-eight of those waited a pass each, which is five seconds of a
+		// game that has stopped. There used to be eight made in advance here, which was eight
+		// fewer waits out of fifty-eight. Now the sound is handed its source at once and the
+		// worker makes the Steam Audio one behind it at the top of its next pass; until then the
+		// sound is judged by the result found at its spot a moment ago, exactly as one of those
+		// eight was, because a spare was not simulated where the sound is either (see prime_source).
 		auto s = std::make_unique<sound_environment_source>();
-		IPLSourceSettings settings {IPL_SIMULATIONFLAGS_DIRECT};
-		if (iplSourceCreate(sim, &settings, &s->source) != IPL_STATUS_SUCCESS) return nullptr;
 		sound_environment_source* result = s.get();
-		sources.push_back(std::move(s));
-		wake_requested = true;
+		{
+			std::lock_guard<std::mutex> pl(pending_m);
+			pending.push_back(std::move(s));
+		}
+		wake_requested = true; // Make it, and simulate it.
 		wake.notify_all();
 		return result;
 	}
