@@ -8,12 +8,13 @@ vcpkg_from_github(
         add-no-compiler.patch
         mark-threads-private.patch
         fix-dependency.patch
+        fix-double-literal-precision.patch
 )
 
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}/sdk/angelscript/projects/cmake"
     OPTIONS
-        "-DAS_NO_COMPILER=OFF" "-DCMAKE_CXX_STANDARD=11"
+        "-DAS_NO_COMPILER=ON" "-DCMAKE_CXX_STANDARD=11"
 )
 
 vcpkg_cmake_install()
