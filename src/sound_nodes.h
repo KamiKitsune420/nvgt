@@ -225,6 +225,23 @@ class freeverb_node : public virtual audio_node {
 	virtual bool get_frozen() const = 0;
 	static freeverb_node* create(audio_engine* engine);
 };
+// Runs a sound through a recorded impulse response: a loudspeaker cabinet, a telephone, the
+// inside of a helmet. The impulse is read once, when the node is made, through the sound
+// system's own file system, so it is found wherever a sound would be, and resampled to the
+// engine's rate. It is convolved directly, which adds no latency and suits the short
+// responses of a box or a speaker; a hall's, seconds long, is what freeverb is for, and the
+// length is capped at max_frames for that reason. An impulse that cannot be read leaves the
+// node passing its input through untouched.
+class convolution_node : public virtual audio_node {
+public:
+	virtual unsigned int get_impulse_frames() const = 0;
+	virtual unsigned int get_impulse_channels() const = 0;
+	virtual void set_wet(float wet) = 0;
+	virtual float get_wet() const = 0;
+	virtual void set_dry(float dry) = 0;
+	virtual float get_dry() const = 0;
+	static convolution_node* create(const std::string& impulse, unsigned int max_frames, audio_engine* engine);
+};
 class reverb3d : public virtual passthrough_node {
 public:
 	virtual void set_reverb(audio_node* verb) = 0;

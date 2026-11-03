@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -490,6 +491,118 @@ class freeverb_node_impl : public audio_node_impl, public virtual freeverb_node 
 	bool get_frozen() const override { return rn? verblib_get_mode(&rn->reverb) >= 0.5 : false; }
 };
 freeverb_node* freeverb_node::create(audio_engine* e) { return new freeverb_node_impl(e); }
+
+class convolution_node_impl : public effect_node_impl, public virtual convolution_node {
+	// The longest impulse accepted whatever is asked for: direct convolution costs its length
+	// in multiplies per sample per channel.
+	static constexpr unsigned int most_frames = 16384;
+	// How much of the end of an impulse cut short is faded out, so the cut does not click.
+	static constexpr unsigned int cut_fade_frames = 64;
+	unsigned int channels;
+	unsigned int length = 0, impulse_channels = 0;
+	// Each channel of the impulse, back to front, so that one pass along it meets the newest
+	// sample first.
+	vector<float> taps;
+	// Each channel's last length samples, twice over end to end, so the window of them is one
+	// unbroken run of memory wherever the write position has got to.
+	vector<float> history;
+	unsigned int write = 0;
+	atomic<float> wet, dry;
+	void load(const string& impulse, unsigned int max_frames) {
+		if (max_frames < 1) max_frames = 1;
+		if (max_frames > most_frames) max_frames = most_frames;
+		audio_decoder* decoder = audio_decoder::create(get_engine());
+		if (!decoder) return;
+		if (!decoder->open(impulse, nullptr, get_engine()->get_sample_rate(), 0)) {
+			decoder->release();
+			return;
+		}
+		unsigned int ch = decoder->get_channels();
+		vector<float> raw;
+		if (ch > 0) {
+			vector<float> block(1024 * ch);
+			// One frame past the most wanted, to tell an impulse cut short from one that fits.
+			while (raw.size() / ch <= max_frames) {
+				unsigned long long got = decoder->read(block.data(), 1024);
+				if (!got) break;
+				raw.insert(raw.end(), block.begin(), block.begin() + got * ch);
+			}
+		}
+		decoder->release();
+		if (ch == 0 || raw.empty()) return;
+		unsigned int frames = static_cast<unsigned int>(raw.size() / ch);
+		bool cut = frames > max_frames;
+		if (cut) frames = max_frames;
+		// Scaled to carry as much energy as it lets through, so swapping one impulse for another
+		// changes the colour of a sound and not how loud it is.
+		double energy = 0;
+		for (unsigned int i = 0; i < frames * ch; i++) energy += double(raw[i]) * raw[i];
+		energy /= ch;
+		if (energy <= 0) return;
+		float scale = float(1.0 / sqrt(energy));
+		taps.assign(size_t(frames) * ch, 0.0f);
+		for (unsigned int c = 0; c < ch; c++) {
+			for (unsigned int k = 0; k < frames; k++) {
+				float s = raw[size_t(k) * ch + c] * scale;
+				if (cut && k + cut_fade_frames >= frames) s *= float(frames - k) / (cut_fade_frames + 1);
+				taps[size_t(c) * frames + (frames - 1 - k)] = s;
+			}
+		}
+		history.assign(size_t(channels) * 2 * frames, 0.0f);
+		impulse_channels = ch;
+		length = frames;
+	}
+public:
+	convolution_node_impl(const string& impulse, unsigned int max_frames, audio_engine* e) : effect_node_impl(e, 0, 0, 1, 1, 0), wet(1.0f), dry(0.0f) {
+		channels = get_engine()->get_channels();
+		load(impulse, max_frames);
+	}
+	void process(const float** frames_in, unsigned int* frame_count_in, float** frames_out, unsigned int* frame_count_out) override {
+		unsigned int n = *frame_count_in < *frame_count_out ? *frame_count_in : *frame_count_out;
+		*frame_count_in = *frame_count_out = n;
+		const float* in = frames_in ? frames_in[0] : nullptr;
+		float* out = frames_out[0];
+		if (!in) {
+			memset(out, 0, sizeof(float) * n * channels);
+			return;
+		}
+		if (!length) {
+			if (out != in) memcpy(out, in, sizeof(float) * n * channels);
+			return;
+		}
+		float w = wet.load(std::memory_order_relaxed), d = dry.load(std::memory_order_relaxed);
+		for (unsigned int f = 0; f < n; f++) {
+			for (unsigned int c = 0; c < channels; c++) {
+				float s = in[size_t(f) * channels + c];
+				float* h = &history[size_t(c) * 2 * length];
+				h[write] = s;
+				h[write + length] = s;
+				const float* window = h + write + 1;
+				const float* t = &taps[size_t(c < impulse_channels ? c : impulse_channels - 1) * length];
+				// Four sums side by side, which a compiler can keep in one vector register without
+				// reordering any arithmetic; a single sum is a chain of adds each waiting on the last.
+				float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+				unsigned int k = 0;
+				for (; k + 4 <= length; k += 4) {
+					a0 += window[k] * t[k];
+					a1 += window[k + 1] * t[k + 1];
+					a2 += window[k + 2] * t[k + 2];
+					a3 += window[k + 3] * t[k + 3];
+				}
+				for (; k < length; k++) a0 += window[k] * t[k];
+				out[size_t(f) * channels + c] = d * s + w * ((a0 + a1) + (a2 + a3));
+			}
+			write = write + 1 == length ? 0 : write + 1;
+		}
+	}
+	unsigned int get_impulse_frames() const override { return length; }
+	unsigned int get_impulse_channels() const override { return impulse_channels; }
+	void set_wet(float value) override { wet.store(value); }
+	float get_wet() const override { return wet.load(); }
+	void set_dry(float value) override { dry.store(value); }
+	float get_dry() const override { return dry.load(); }
+};
+convolution_node* convolution_node::create(const string& impulse, unsigned int max_frames, audio_engine* e) { return new convolution_node_impl(impulse, max_frames, e); }
 
 class reverb3d_impl : public passthrough_node_impl, public virtual reverb3d {
 	audio_node* reverb;

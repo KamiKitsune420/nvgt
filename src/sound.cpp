@@ -2724,6 +2724,14 @@ void RegisterSoundsystemNodes(asIScriptEngine *engine) {
 	engine->RegisterObjectMethod("audio_delay_node", "float get_dry() const property", asFUNCTION((virtual_call < delay_node, &delay_node::get_dry, float >)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("audio_delay_node", "void set_decay(float decay) property", asFUNCTION((virtual_call < delay_node, &delay_node::set_decay, void, float >)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("audio_delay_node", "float get_decay() const property", asFUNCTION((virtual_call < delay_node, &delay_node::get_decay, float >)), asCALL_CDECL_OBJFIRST);
+	RegisterSoundsystemAudioNode <convolution_node> (engine, "audio_convolution_node");
+	engine->RegisterObjectBehaviour("audio_convolution_node", asBEHAVE_FACTORY, "audio_convolution_node@ c(const string&in impulse, uint max_frames = 2048, audio_engine@+ engine = sound_default_engine)", asFUNCTION(convolution_node::create), asCALL_CDECL);
+	engine->RegisterObjectMethod("audio_convolution_node", "uint get_impulse_frames() const property", asFUNCTION((virtual_call < convolution_node, &convolution_node::get_impulse_frames, unsigned int >)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("audio_convolution_node", "uint get_impulse_channels() const property", asFUNCTION((virtual_call < convolution_node, &convolution_node::get_impulse_channels, unsigned int >)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("audio_convolution_node", "void set_wet(float wet) property", asFUNCTION((virtual_call < convolution_node, &convolution_node::set_wet, void, float >)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("audio_convolution_node", "float get_wet() const property", asFUNCTION((virtual_call < convolution_node, &convolution_node::get_wet, float >)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("audio_convolution_node", "void set_dry(float dry) property", asFUNCTION((virtual_call < convolution_node, &convolution_node::set_dry, void, float >)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("audio_convolution_node", "float get_dry() const property", asFUNCTION((virtual_call < convolution_node, &convolution_node::get_dry, float >)), asCALL_CDECL_OBJFIRST);
 	RegisterSoundsystemAudioNode <freeverb_node> (engine, "audio_freeverb_node");
 	engine->RegisterObjectBehaviour("audio_freeverb_node", asBEHAVE_FACTORY, "audio_freeverb_node@ n(audio_engine@+ engine = sound_default_engine)", asFUNCTION(freeverb_node::create), asCALL_CDECL);
 	engine->RegisterObjectMethod("audio_freeverb_node", "void set_room_size(float size) property", asFUNCTION((virtual_call < freeverb_node, &freeverb_node::set_room_size, void, float >)), asCALL_CDECL_OBJFIRST);
