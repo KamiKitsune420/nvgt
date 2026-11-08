@@ -88,3 +88,8 @@ Every one failed quietly before: the port compiled, ran, and could not read its 
 * **file_encrypt / file_decrypt**: `bgt_swcr_encrypt` / `bgt_swcr_decrypt`, where this used `asset_encryptor`. BGT writes `"SWCR"`, the length three times, a tag and AES-256-ECB of the data -- which is also how an entry inside an SFPv asset pack is encrypted. `file_decrypt` returns false on a wrong key rather than writing an empty file.
 
 A BGT save path is `serialize()` into `string_compress()` into `string_encrypt()`, so all three links have to agree: one of them in a different format breaks the whole chain and fails at the decrypt, with nothing to say which layer was wrong.
+
+### Upgrading a game that was already ported
+The three readers accept **either** format, so a game ported with the older shims keeps working and its players keep their saves: `string_decompress` tries BGT's codec and then zlib, `string_decrypt` tries BGT's arrangement and then `string_aes_decrypt`, and `file_decrypt` tries BGT's container and then `asset_decryptor`. The writers only ever produce BGT's format, so a save written from now on is one BGT itself can read.
+
+That is safe rather than a guess because each format refuses what is not its own: BGT's compressed blob declares its uncompressed length and the decoder checks it exactly, and BGT's plaintext has to begin `printf` and declare its own length. A blob neither reader can open gives back an empty string, which is BGT's own answer for one -- the fallbacks catch the exception NVGT's readers throw and convert it, so a corrupt save does not put an unhandled exception on the player's screen where the original game handled an empty string.

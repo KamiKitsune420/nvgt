@@ -201,8 +201,15 @@ string string_encrypt(const string& in the_string, const string& in encryption_k
 	return bgt_string_encrypt(the_string, encryption_key);
 }
 
+// Reads EITHER, for the same reason, and on stronger evidence: BGT's plaintext has to
+// begin "printf" and declare its own length, so a blob encrypted the old way fails
+// that check instead of decrypting to rubbish. Caught for the same reason as
+// string_decompress: BGT answers an empty string where NVGT's reader may throw.
 string string_decrypt(const string& in the_string, const string& in encryption_key) {
-	return bgt_string_decrypt(the_string, encryption_key);
+	string plain = bgt_string_decrypt(the_string, encryption_key);
+	if (!plain.is_empty() or the_string.is_empty()) return plain;
+	try { return string_aes_decrypt(the_string, encryption_key); }
+	catch { return ""; }
 }
 
 // file_encrypt / file_decrypt, in BGT's own container rather than NVGT's.
@@ -234,10 +241,19 @@ bool file_decrypt(const string&in input_file, const string&in output_file, strin
 	string blob = input.read();
 	input.close();
 	string data = bgt_swcr_decrypt(blob, key);
-	// An empty answer is a refusal: a wrong key, a truncated file or a container
-	// that is not BGT's. Reporting it is the point -- writing an empty file and
-	// returning true is how a bad key looks like a successful decrypt.
-	if (data.is_empty() and !blob.is_empty()) return false;
+	// An empty answer is a refusal: a wrong key, a truncated file, or a container that
+	// is not BGT's -- which includes one this layer wrote itself before it knew BGT's.
+	// So the old reader gets a turn before the failure is reported, and only a file
+	// neither can open returns false. Writing an empty file and returning true is how
+	// a bad key looks like a successful decrypt, and that is what this avoids.
+	if (data.is_empty() and !blob.is_empty()) {
+		file old_input;
+		if (!old_input.open(input_file, "rb")) return false;
+		try { data = asset_decryptor(old_input, key).read(); }
+		catch { data = ""; }
+		old_input.close();
+		if (data.is_empty()) return false;
+	}
 	file output;
 	if (!output.open(output_file, "wb")) return false;
 	bool ok = output.write(data) == data.length();
@@ -368,8 +384,22 @@ bool generate_profile(const string& in filename) {
 string string_compress(string str) {
 	return bgt_string_compress(str);
 }
+// Reads EITHER, writes BGT's -- so updating a game that was already ported with the
+// old zlib shim does not strand the saves its players have. BGT's format declares its
+// own uncompressed length after a trailing space and the decoder refuses anything
+// whose output does not match it exactly, so a deflate stream is rejected cleanly
+// rather than half-decoded, which is what makes the fallback safe rather than a guess.
+//
+// The fallback is CAUGHT, because the two engines disagree about failure as well as
+// about format: BGT's string_decompress returns an empty string for a blob it cannot
+// read, and string_inflate throws. Left to throw, a corrupt save would put an
+// unhandled exception on the player's screen where the game it was ported from would
+// have handled an empty string -- so the exception is converted back into BGT's answer.
 string string_decompress(string str) {
-	return bgt_string_decompress(str);
+	string plain = bgt_string_decompress(str);
+	if (!plain.is_empty() or str.is_empty()) return plain;
+	try { return string_inflate(str); }
+	catch { return ""; }
 }
 
 //key constants

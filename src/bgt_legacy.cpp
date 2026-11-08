@@ -53,6 +53,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <utility>   // std::swap, which MSVC pulls in transitively and libstdc++ does not
 #include <vector>
 #include <angelscript.h>
 #include <obfuscate.h>
