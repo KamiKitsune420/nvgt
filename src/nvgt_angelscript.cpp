@@ -65,6 +65,7 @@
 #include "random.h"
 #include "reactphysics.h"
 #include "scriptstuff.h"
+#include "bgt_legacy.h"
 #include "serialize.h"
 #include "sound.h"
 #include "system_fingerprint.h"
@@ -507,6 +508,13 @@ int ConfigureEngine(asIScriptEngine *engine) {
 	engine->SetDefaultAccessMask(NVGT_SUBSYSTEM_GENERAL);
 	engine->BeginConfigGroup("serialization");
 	RegisterSerializationFunctions(engine);
+	engine->EndConfigGroup();
+	// BGT's own compression, dictionary wire format and computer id, bit for bit.
+	// bgt_compat.nvgt routes string_compress, serialize and generate_computer_id
+	// here, because NVGT's own equivalents are a different FORMAT in each case and a
+	// ported game silently cannot read what its BGT build wrote.
+	engine->BeginConfigGroup("bgt_legacy");
+	RegisterBgtLegacyFunctions(engine);
 	engine->EndConfigGroup();
 	engine->BeginConfigGroup("xplatform");
 	RegisterXplatform(engine);

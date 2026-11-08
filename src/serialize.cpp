@@ -28,6 +28,7 @@
 #include <Poco/Net/NameValueCollection.h>
 #include <scriptarray.h>
 #include <scriptdictionary.h>
+#include "bgt_legacy.h"
 #include "nvgt.h"
 #include "pocostuff.h"
 #include "serialize.h"
@@ -459,7 +460,16 @@ std::string serialize(CScriptDictionary& dict) {
 }
 CScriptDictionary* deserialize(const std::string& input) {
 	if (input.size() >= 4 && !memcmp(input.data(), LEGACY_MAGIC, 4)) return deserialize_legacy(input);
-	if (input.size() < sizeof(CURRENT_HEADER) || memcmp(input.data(), CURRENT_HEADER, 4) != 0) return CScriptDictionary::Create(g_ScriptEngine);
+	if (input.size() < sizeof(CURRENT_HEADER) || memcmp(input.data(), CURRENT_HEADER, 4) != 0) {
+		// Neither of NVGT's own formats. A dictionary BGT serialized is base64 keys
+		// and text values, which cannot collide with either header -- both of those
+		// open with 0x0E, and that is not a base64 character. Reading it here is what
+		// lets a game ported from BGT load the save its BGT build wrote; without it
+		// the answer was an empty dictionary and no explanation, so the loaded game
+		// silently started over.
+		if (bgt_looks_serialized(input)) return bgt_deserialize(input);
+		return CScriptDictionary::Create(g_ScriptEngine);
+	}
 	Poco::MemoryInputStream ms(input.data() + sizeof(CURRENT_HEADER), input.size() - sizeof(CURRENT_HEADER));
 	Poco::BinaryReader r(ms);
 	r.setExceptions();

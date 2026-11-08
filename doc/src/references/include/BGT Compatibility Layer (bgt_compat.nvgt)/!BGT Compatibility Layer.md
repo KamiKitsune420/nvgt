@@ -64,14 +64,27 @@ Note that these functions don't map cleanly to how NVGT's API works. As such, su
 * string_contains: string.find.
 * get_last_error_text: Superseded by exceptions.
 * string_to_number: parse_float.
-* string_compress: string_deflate.
-* string_decompress: string_inflate.
+* string_compress: BGT's own LZ77, not deflate. See below.
+* string_decompress: BGT's own LZ77, not inflate. See below.
 
 ## String encryption/decryption:
-Note that these functions don't work with existing BGT data.
-* string_encrypt.
-* string_decrypt.
+These do work with existing BGT data: they are BGT's own arrangement rather than NVGT's `string_aes_encrypt`. A wrong key is rejected rather than returning rubbish, so `string_decrypt` gives back an empty string.
+* string_encrypt: bgt_string_encrypt.
+* string_decrypt: bgt_string_decrypt.
 
 ## UI functions:
 * show_game_window: show_window.
 * is_game_window_active: is_window_active.
+
+## Formats BGT wrote, which this layer now reads and writes exactly
+A ported game has to read the data its BGT build wrote, and five of these are a *format* rather than a spelling. Each was read out of `bgt.exe` and then checked by asking the engine: the ported function's output is byte for byte what BGT produces, and BGT reads what the port writes.
+
+Every one failed quietly before: the port compiled, ran, and could not read its own old data.
+
+* **generate_computer_id**: `bgt_generate_computer_id`, where this used to answer with `generate_system_fingerprint`. A game checks its registration key against this value, so a different number means a key the player already holds never validates. Agrees with BGT's own answer on 44 of 44 game names, and it is the same algorithm in every engine from BGT 1.3 to the 2019 Manamon build. Windows only, because every component is -- the geometry of PhysicalDrive0, C:'s volume serial, CPUID and the installed memory -- and elsewhere the fingerprint is used instead.
+* **string_compress / string_decompress**: `bgt_string_compress` / `bgt_string_decompress`, where this used to use zlib. BGT's is its own LZ77 with a trailing `" <uncompressed length>"`, which is the same codec its module container uses.
+* **serialize**: `bgt_serialize`, where this used to call `dictionary::serialize()`. BGT writes one entry as `base64(key)`, a NUL, a type byte, the value as text and a NUL, with 1 an integer, 2 a double written `"%f"` (six decimals, so the precision really is lost), 3 base64 of a string and 4 a bool. An array or a nested dictionary is dropped, which is what BGT does too.
+* **deserialize**: unchanged in name, because NVGT registers it -- the engine's own `deserialize` reads BGT's format as well now, so a port loads old saves and new ones alike. NVGT's two formats both begin with a byte that is not base64, so the two can never be confused.
+* **file_encrypt / file_decrypt**: `bgt_swcr_encrypt` / `bgt_swcr_decrypt`, where this used `asset_encryptor`. BGT writes `"SWCR"`, the length three times, a tag and AES-256-ECB of the data -- which is also how an entry inside an SFPv asset pack is encrypted. `file_decrypt` returns false on a wrong key rather than writing an empty file.
+
+A BGT save path is `serialize()` into `string_compress()` into `string_encrypt()`, so all three links have to agree: one of them in a different format breaks the whole chain and fails at the decrypt, with nothing to say which layer was wrong.
